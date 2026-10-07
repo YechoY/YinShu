@@ -31,29 +31,35 @@
 ```
 playlist-sync-hub/                 # uv 项目根（pyproject.toml / uv.lock / .venv）
 ├── README.md
-├── docs/                          # 文档统一
-│   ├── 01~11 *.md                 #   正式文档（需求/架构/引擎/评审…）
-│   ├── spec/                      #   canonical-v1 规范 + Schema + 校验器
-│   └── archive/                   #   历史方案（方案-v0 / 前身 / 设计说明书 v1）
+├── docs/                          # 文档统一（**先看 docs/README.md 这一页导览**）
+│   ├── README.md                  #   文档导览：哪份权威、哪份是历史
+│   ├── 01~12 *.md                 #   权威文档，编号即阅读顺序（09 是全部决策记录）
+│   ├── spec/                      #   canonical-v1 规范 + Schema + 校验器 + 样例
+│   ├── notes/                     #   历史留档：各轮修改文档 / 复核报告（**非现状**）
+│   └── archive/                   #   已废弃方案（方案-v0 / 前身 / 设计说明书 v1）
 ├── src/                           # 源码（打包：engine + hub 两个包）
 │   ├── engine/                    #   合并引擎（canonical / engine / SyncSpace）
 │   └── hub/                       #   同步服务（api / store / adapters / run_fastapi）
 ├── tests/                         # 测试与源码分离
-│   ├── engine/                    #   58 条合并引擎用例（38 基础 + 多设备 M1/M2/M8 + P0.5 never_owned + 第三轮 peek_view 纯读 + 第四轮删除免确认 9 条）
-│   └── hub/                       #   56 条服务测试（8 冒烟 + 18 HTTP 验收 + 4 设备路由 + 26 空间与成员）
-├── scripts/                       # 诊断/调试脚本（engine / hub 分开）
+│   ├── engine/                    #   58 条合并引擎用例（38 基础 + 多设备 M1/M2/M8 + P0.5 never_owned + 第三轮 peek_view 纯读 + 第四轮删除免确认）
+│   └── hub/                       #   60 条服务测试（8 冒烟 + 18 HTTP 验收 + 4 设备路由 + 26 空间与成员 + 第四轮）
+├── scripts/                       # 脚本（与源码、测试分离）
+│   ├── engine/ hub/               #   诊断/调试脚本（读空间、看 journal、端到端探针）
+│   └── dev/                       #   开发工具：run_tests_here.py、check_sync*.py 等
 ├── webui/                         # 前端 Vue 3 工程（Vite 构建）
 │   ├── src/                       #   App.vue + components/（Login/Sidebar/TrackPanel/StatusBar）+ lib/
 │   ├── index.html  vite.config.js  package.json
 │   └── dist/                      #   构建产物（FastAPI 托管；改动前端后 npm run build）
 ├── data/spaces/                   # 运行数据（space__main.pkl + _index.json，gitignore）
-├── tmp/                           # 测试临时空间（gitignore，Windows 锁偶尔留残不影响）
+├── backups/                       # config.json 的快照备份（含密码，gitignore）
+├── tmp/                           # 测试临时空间（gitignore；logs/ 保留历次测试输出）
 ├── plugins/
 │   └── ceru-webdav-sync/          # 澜音插件「webdav歌单同步」（id=ceru.webdav-sync）
 │       ├── src/                   #   index.js（宿主编排）+ sync-core.js（纯逻辑）
 │       ├── test/                  #   12 + 15 条测试
 │       ├── ui/  dist/  release/   #   设置页 / 构建产物 / 交付版本
-└── .gitignore                     # 忽略 .venv / __pycache__ / .pytest_cache / tmp / data/spaces …
+│       └──（本目录是**独立 git 仓库**的开发副本，不并入本仓库；正式仓库在工作区根 `ceru-cyshine-webdav/`）
+└── .gitignore                     # 忽略 .venv / node_modules / __pycache__ / tmp / dist / data/spaces / config.json …
 ```
 
 ## 运行方式
@@ -94,6 +100,7 @@ cd plugins/ceru-webdav-sync && npm test
 
 ## 阅读顺序（新人 15 分钟版）
 
+0. [`docs/README.md`](docs/README.md) → 一眼看清哪份文档是权威、哪份只是历史留档
 1. 本 README 的"一页速览"
 2. `docs/01-需求与验收.md` → 知道要满足什么
 3. `docs/03-总体架构.md` → 知道整体长什么样
