@@ -1,0 +1,177 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://yechoy.cn/spec/canonical-v1.schema.json",
+  "title": "歌单同步统一格式 canonical-v1",
+  "description": "跨平台歌单同步服务的内部唯一事实格式。规则文本见 canonical-v1.md。",
+  "type": "object",
+  "required": ["schemaVersion", "generatedAt", "playlists", "tracks"],
+  "additionalProperties": false,
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "generatedAt": { "$ref": "#/$defs/timestamp" },
+    "playlists": { "type": "array", "items": { "$ref": "#/$defs/playlist" } },
+    "tracks": { "type": "array", "items": { "$ref": "#/$defs/track" } },
+    "tombstones": { "type": "array", "items": { "$ref": "#/$defs/tombstone" }, "default": [] },
+    "ext": { "$ref": "#/$defs/ext" }
+  },
+  "$defs": {
+    "timestamp": {
+      "type": "string",
+      "format": "date-time",
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(\\.\\d{1,6})?(Z|[+-]\\d{2}:\\d{2})$"
+    },
+    "ext": { "type": "object" },
+    "sourceCode": { "type": "string", "pattern": "^[a-z][a-z0-9_]{0,31}$" },
+    "canonicalId": { "type": "string", "pattern": "^(pl|tr)_[0-9A-HJKMNP-TV-Z]{26}$" },
+    "identity": {
+      "type": "object",
+      "required": ["source", "songId"],
+      "additionalProperties": false,
+      "properties": {
+        "source": { "$ref": "#/$defs/sourceCode" },
+        "songId": { "type": "string", "minLength": 1, "maxLength": 2048 }
+      }
+    },
+    "artist": {
+      "type": "object",
+      "required": ["name"],
+      "additionalProperties": false,
+      "properties": {
+        "name": { "type": "string", "minLength": 1, "maxLength": 512 },
+        "id": { "type": ["string", "null"], "maxLength": 2048 }
+      }
+    },
+    "album": {
+      "type": ["object", "null"],
+      "required": ["name"],
+      "additionalProperties": false,
+      "properties": {
+        "name": { "type": "string", "minLength": 1, "maxLength": 512 },
+        "id": { "type": ["string", "null"], "maxLength": 2048 }
+      }
+    },
+    "quality": {
+      "type": "object",
+      "required": ["code"],
+      "additionalProperties": false,
+      "properties": {
+        "code": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "sizeBytes": { "type": "integer", "minimum": 0 },
+        "available": { "type": "boolean" },
+        "ext": { "$ref": "#/$defs/ext" }
+      }
+    },
+    "nativeQuality": {
+      "type": "object",
+      "required": ["nativeCode"],
+      "additionalProperties": false,
+      "properties": {
+        "nativeCode": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "code": { "type": ["string", "null"], "maxLength": 64 },
+        "sizeBytes": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "platformRef": {
+      "type": "object",
+      "required": ["songId"],
+      "additionalProperties": false,
+      "properties": {
+        "songId": { "type": "string", "minLength": 1, "maxLength": 2048 },
+        "mediaMid": { "type": ["string", "null"], "maxLength": 2048 },
+        "albumId": { "type": ["string", "null"], "maxLength": 2048 },
+        "qualitys": { "type": "array", "items": { "$ref": "#/$defs/nativeQuality" }, "maxItems": 128 },
+        "playable": { "type": "boolean" },
+        "unavailableReason": { "type": ["string", "null"], "maxLength": 512 },
+        "ext": { "$ref": "#/$defs/ext" }
+      }
+    },
+    "availability": {
+      "type": "object",
+      "required": ["state"],
+      "additionalProperties": false,
+      "properties": {
+        "state": { "enum": ["ok", "unavailable", "unknown"] },
+        "reason": { "type": ["string", "null"], "maxLength": 512 },
+        "checkedAt": { "anyOf": [{ "$ref": "#/$defs/timestamp" }, { "type": "null" }] }
+      }
+    },
+    "playlist": {
+      "type": "object",
+      "required": ["id", "name", "createdAt", "updatedAt", "trackIds"],
+      "additionalProperties": false,
+      "properties": {
+        "id": { "$ref": "#/$defs/canonicalId" },
+        "name": { "type": "string", "minLength": 1, "maxLength": 512 },
+        "description": { "type": ["string", "null"], "maxLength": 4096 },
+        "coverUrl": { "type": ["string", "null"], "maxLength": 2048 },
+        "createdAt": { "$ref": "#/$defs/timestamp" },
+        "updatedAt": { "$ref": "#/$defs/timestamp" },
+        "deletedAt": { "anyOf": [{ "$ref": "#/$defs/timestamp" }, { "type": "null" }] },
+        "trackIds": {
+          "type": "array",
+          "items": { "type": "string", "pattern": "^tr_[0-9A-HJKMNP-TV-Z]{26}$" },
+          "uniqueItems": true
+        },
+        "platforms": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "object",
+            "required": ["nativeId"],
+            "additionalProperties": false,
+            "properties": {
+              "nativeId": { "type": "string", "minLength": 1, "maxLength": 512 },
+              "nativeName": { "type": ["string", "null"], "maxLength": 512 },
+              "ext": { "$ref": "#/$defs/ext" }
+            }
+          }
+        },
+        "ownerRef": {
+          "type": ["object", "null"],
+          "additionalProperties": true,
+          "properties": {
+            "source": { "$ref": "#/$defs/sourceCode" },
+            "id": { "type": ["string", "null"] },
+            "name": { "type": ["string", "null"] },
+            "creator": { "type": ["string", "null"] }
+          }
+        },
+        "ext": { "$ref": "#/$defs/ext" }
+      }
+    },
+    "track": {
+      "type": "object",
+      "required": ["id", "identity", "title", "artists", "addedAt", "updatedAt"],
+      "additionalProperties": false,
+      "properties": {
+        "id": { "$ref": "#/$defs/canonicalId" },
+        "identity": { "$ref": "#/$defs/identity" },
+        "title": { "type": "string", "minLength": 1, "maxLength": 4096 },
+        "artists": { "type": "array", "items": { "$ref": "#/$defs/artist" }, "maxItems": 128 },
+        "album": { "$ref": "#/$defs/album" },
+        "durationMs": { "type": ["integer", "null"], "minimum": 0 },
+        "artworkUrl": { "type": ["string", "null"], "maxLength": 2048 },
+        "releaseDate": { "type": ["string", "null"], "pattern": "^\\d{4}-\\d{2}-\\d{2}$" },
+        "qualities": { "type": "array", "items": { "$ref": "#/$defs/quality" }, "maxItems": 128 },
+        "preferredQuality": { "type": ["string", "null"], "maxLength": 64 },
+        "platforms": { "type": "object", "additionalProperties": { "$ref": "#/$defs/platformRef" } },
+        "availability": { "$ref": "#/$defs/availability" },
+        "addedAt": { "$ref": "#/$defs/timestamp" },
+        "updatedAt": { "$ref": "#/$defs/timestamp" },
+        "deletedAt": { "anyOf": [{ "$ref": "#/$defs/timestamp" }, { "type": "null" }] },
+        "ext": { "$ref": "#/$defs/ext" }
+      }
+    },
+    "tombstone": {
+      "type": "object",
+      "required": ["element", "id", "deletedAt"],
+      "additionalProperties": false,
+      "properties": {
+        "element": { "enum": ["track", "playlist"] },
+        "id": { "type": "string", "minLength": 1 },
+        "deletedAt": { "$ref": "#/$defs/timestamp" },
+        "device": { "type": ["string", "null"], "maxLength": 128 },
+        "reason": { "type": ["string", "null"], "maxLength": 128 }
+      }
+    }
+  }
+}

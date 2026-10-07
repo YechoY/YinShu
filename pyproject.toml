@@ -1,0 +1,36 @@
+[project]
+name = "playlist-sync-hub"
+version = "0.1.0"
+description = "跨平台歌单同步枢纽：澜音 / 栖弦 双端合并同步（canonical 统一模型 + 三路合并引擎）"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/engine", "src/hub"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+# 缓存与临时目录统一收到项目 tmp/：
+#  - 启动插件 hub.pytest_tmpfix：进程最早阶段把 tempfile 临时目录指到 tmp/（杜绝探针残留）
+#  - --basetemp：pytest tmp_path 测试产物
+#  - cache_dir：pytest 缓存
+addopts = "-q -p hub.pytest_tmpfix --basetemp=tmp/pytest"
+cache_dir = "tmp/pytest_cache"
+
+[[tool.uv.index]]
+url = "https://mirrors.aliyun.com/pypi/simple/"
+default = true
