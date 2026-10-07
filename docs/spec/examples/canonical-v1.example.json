@@ -1,0 +1,164 @@
+{
+  "schemaVersion": 1,
+  "generatedAt": "2026-10-05T18:00:00Z",
+  "playlists": [
+    {
+      "id": "pl_01J9Z8Q3K7W2M4X6B8C0D2E4F6",
+      "name": "Yes",
+      "description": "摇滚 / 现场",
+      "coverUrl": null,
+      "createdAt": "2026-09-12T03:11:00Z",
+      "updatedAt": "2026-10-05T17:58:12Z",
+      "deletedAt": null,
+      "trackIds": [
+        "tr_01J9Z8Q3K7W2M4X6B8C0D2E4G1",
+        "tr_01J9Z8Q3K7W2M4X6B8C0D2E4G2",
+        "tr_01J9Z8Q3K7W2M4X6B8C0D2E4G3"
+      ],
+      "platforms": {
+        "cyshine": { "nativeId": "lx-1759000000-3", "nativeName": "Yes" },
+        "ceru": { "nativeId": "b044b8d12de3256ac0de3ebaddcf5bb5", "nativeName": "Yes" }
+      },
+      "ownerRef": null,
+      "ext": {}
+    },
+    {
+      "id": "pl_01J9Z8Q3K7W2M4X6B8C0D2E4F5",
+      "name": "纯音乐",
+      "description": null,
+      "coverUrl": "https://example.invalid/cover.jpg",
+      "createdAt": "2026-09-01T00:00:00Z",
+      "updatedAt": "2026-10-04T08:20:00Z",
+      "trackIds": ["tr_01J9Z8Q3K7W2M4X6B8C0D2E4G4"],
+      "platforms": {
+        "cyshine": { "nativeId": "lx-1759000000-1", "nativeName": "纯音乐" },
+        "ceru": { "nativeId": "dbdbf225dc94f5b907294c7577d993c9", "nativeName": "纯音乐" }
+      },
+      "ext": {}
+    }
+  ],
+  "tracks": [
+    {
+      "id": "tr_01J9Z8Q3K7W2M4X6B8C0D2E4G1",
+      "identity": { "source": "tx", "songId": "003pgMEF0B7mWV" },
+      "title": "示例歌曲（QQ + 网易云双平台可用）",
+      "artists": [{ "name": "示例歌手" }],
+      "album": { "name": "示例专辑", "id": "002fRO0N4FftzY" },
+      "durationMs": 207000,
+      "artworkUrl": "https://example.invalid/pic.jpg",
+      "releaseDate": "2024-05-01",
+      "qualities": [
+        { "code": "flac24bit", "sizeBytes": 42000000, "available": true },
+        { "code": "320k", "sizeBytes": 8400000, "available": true }
+      ],
+      "preferredQuality": "flac24bit",
+      "platforms": {
+        "tx": {
+          "songId": "003pgMEF0B7mWV",
+          "mediaMid": "003pgMEF0B7mWV",
+          "albumId": "002fRO0N4FftzY",
+          "qualitys": [
+            { "nativeCode": "size_hires", "code": "flac24bit", "sizeBytes": 42000000 },
+            { "nativeCode": "size_320mp3", "code": "320k", "sizeBytes": 8400000 }
+          ],
+          "playable": true
+        },
+        "wy": {
+          "songId": "1901371647",
+          "qualitys": [{ "nativeCode": "hr", "code": "hires" }],
+          "playable": true
+        }
+      },
+      "availability": { "state": "ok", "reason": null, "checkedAt": "2026-10-05T17:00:00Z" },
+      "addedAt": "2026-10-01T12:30:00Z",
+      "updatedAt": "2026-10-05T17:58:12Z",
+      "deletedAt": null,
+      "ext": {}
+    },
+    {
+      "id": "tr_01J9Z8Q3K7W2M4X6B8C0D2E4G2",
+      "identity": { "source": "kg", "songId": "175036678" },
+      "title": "示例歌曲（酷狗，版权下架）",
+      "artists": [{ "name": "示例歌手" }],
+      "album": null,
+      "durationMs": 245000,
+      "qualities": [{ "code": "128k", "sizeBytes": 3920000, "available": false }],
+      "preferredQuality": null,
+      "platforms": {
+        "kg": {
+          "songId": "175036678",
+          "qualitys": [{ "nativeCode": "viper_clear", "code": "master" }],
+          "playable": false,
+          "unavailableReason": "版权下架"
+        }
+      },
+      "availability": { "state": "unavailable", "reason": "版权下架", "checkedAt": "2026-10-05T17:00:00Z" },
+      "addedAt": "2026-09-12T03:11:00Z",
+      "updatedAt": "2026-10-05T09:00:00Z",
+      "ext": {}
+    },
+    {
+      "id": "tr_01J9Z8Q3K7W2M4X6B8C0D2E4G3",
+      "identity": { "source": "kw", "songId": "337811898" },
+      "title": "示例歌曲（酷我，未知品质码原样保留）",
+      "artists": [{ "name": "歌手 A" }, { "name": "歌手 B" }],
+      "durationMs": null,
+      "qualities": [
+        { "code": "hires", "sizeBytes": 55000000, "available": true },
+        {
+          "code": "vip_ultra_2999",
+          "sizeBytes": 99000000,
+          "available": true,
+          "ext": { "rawCode": "vip_ultra_2999", "note": "未登记品质码，原样保留，禁止静默降级为 128k" }
+        }
+      ],
+      "platforms": {
+        "kw": { "songId": "337811898", "playable": true }
+      },
+      "addedAt": "2026-09-20T10:00:00Z",
+      "updatedAt": "2026-10-02T11:11:11Z",
+      "ext": { "kw.albumRef": { "albumId": "123456", "isVip": true } }
+    },
+    {
+      "id": "tr_01J9Z8Q3K7W2M4X6B8C0D2E4G4",
+      "identity": { "source": "mg", "songId": "6008123B0W" },
+      "title": "示例纯音乐",
+      "artists": [{ "name": "示例作曲家" }],
+      "album": { "name": "示例原声带" },
+      "durationMs": 183000,
+      "qualities": [{ "code": "flac24bit", "sizeBytes": 38000000, "available": true }],
+      "preferredQuality": null,
+      "platforms": {
+        "mg": {
+          "songId": "6008123B0W",
+          "qualitys": [{ "nativeCode": "ZQ24", "code": "flac24bit", "sizeBytes": 38000000 }],
+          "playable": true
+        }
+      },
+      "availability": { "state": "unknown", "reason": null, "checkedAt": null },
+      "addedAt": "2026-09-01T00:00:00Z",
+      "updatedAt": "2026-09-01T00:00:00Z",
+      "ext": {}
+    }
+  ],
+  "tombstones": [
+    {
+      "element": "track",
+      "id": "tr_01J9Z8Q3K7W2M4X6B8C0D2E4H9",
+      "deletedAt": "2026-10-03T07:45:00Z",
+      "device": "phone-7f3a",
+      "reason": "user"
+    },
+    {
+      "element": "playlist",
+      "id": "pl_01J9Z8Q3K7W2M4X6B8C0D2E4H8",
+      "deletedAt": "2026-10-03T07:46:10Z",
+      "device": "phone-7f3a",
+      "reason": "user"
+    }
+  ],
+  "ext": {
+    "lx.playlistOrderHint": "local-first",
+    "spec.notes": "示例文档：含多平台引用、未知品质码、不可用状态、墓碑、命名空间化 ext。"
+  }
+}
