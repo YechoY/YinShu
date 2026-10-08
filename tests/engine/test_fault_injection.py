@@ -57,37 +57,21 @@ class TestFaultInjection(unittest.TestCase):
         r = self.sp.merge("A", sub(pl("p1", "歌单")))
         self.assertTrue(r.meta["suspects"])
         self.assertEqual(live_keys(self.sp, "歌单"), {"tx:x", "wy:y"})  # 未删除
-        self.assertFalse(self.sp.pending_deletions)
 
-    # 安全阀挂起（不可信端点）：单次删除超阈值 → 新增照常、删除挂起、渲染仍含、200、可确认
-    # （第四轮 P1-2：trusted_direct_delete=False 时恢复旧安全阀行为；可信客户端默认直删）
-    def test_safety_valve_defers_add_and_delete(self):
+    # 安全阀（不可信端点）：单次删除超阈值 → 新增照常、该批删除既不生效也不出卡
+    # （D33：确认卡通道已整体移除；不可信端 withholding 由 meta.safety_valve 留痕）
+    def test_safety_valve_withheld_for_untrusted(self):
         self.sp.trusted_direct_delete = False
-        self.sp.delete_cards_enabled = True    # 第八轮默认 False（永不挂卡）；显式测旧通道
         self.sp.merge("A", sub(pl("p1", "歌单", *[("tx", f"t{i}") for i in range(12)])))
         self.sp.deliver("A")
-        # 同时删 11 首（触发）并新增 z → 新增照常应用，删除挂起
+        # 同时删 11 首（触发）并新增 z → 新增照常应用，删除 withheld
         r = self.sp.merge("A", sub(pl("p1", "歌单", ("tx", "t0"), ("tx", "z"))))
         self.assertEqual(r.status, 200)
-        self.assertTrue(r.meta["deferred"])
+        self.assertTrue(r.meta["safety_valve"]["withheld"])
+        self.assertIsNone(r.meta["safety_valve"]["applied"])
         self.assertIn("tx:z", live_keys(self.sp, "歌单"))   # 新增已应用
         self.assertEqual(len(self.sp.tombstones), 0)        # 删除未写墓碑
         self.assertEqual(len(live_keys(self.sp, "歌单")), 13)  # 12 原曲 + z，删除仍含（D4）
-        pid = next(iter(self.sp.pending_deletions))
-        self.sp.confirm_delete(pid)
-        self.assertEqual(live_keys(self.sp, "歌单"), {"tx:t0", "tx:z"})
-
-    # 安全阀：用户放弃（reject）→ 条目保留，不写墓碑（不可信端点）
-    def test_safety_valve_reject_keeps(self):
-        self.sp.trusted_direct_delete = False
-        self.sp.delete_cards_enabled = True
-        self.sp.merge("A", sub(pl("p1", "歌单", *[("tx", f"t{i}") for i in range(12)])))
-        self.sp.deliver("A")
-        self.sp.merge("A", sub(pl("p1", "歌单", ("tx", "t0"))))
-        pid = next(iter(self.sp.pending_deletions))
-        self.sp.reject_delete(pid)
-        self.assertEqual(len(live_keys(self.sp, "歌单")), 12)
-        self.assertEqual(len(self.sp.tombstones), 0)
 
     # I1 / F3：PUT 响应体不算交付，base_served 只在 GET 后推进
     def test_base_served_advances_only_on_get(self):
@@ -106,7 +90,7 @@ class TestFaultInjection(unittest.TestCase):
             self.sp.merge("A", sub(pl("p1", "歌单", ("tx", "x"))))
         self.assertEqual(self.sp.revision, rev)
         # 已删除的条目被未验证新身份反复提交 → 一致压制（幂等），不复活
-        # （第四轮 P1-1：默认无待确认恢复卡，抑制信息由 meta.suppressed_tracks 承载）
+        # （D33：确认卡通道已移除，抑制信息由 meta.suppressed_tracks 承载）
         self.sp.merge("A", sub(pl("p1", "歌单")))
         self.sp.deliver("A")
         self.sp.register_client("D", dialect="cyshine-v1", identity_verified=False)
@@ -114,7 +98,6 @@ class TestFaultInjection(unittest.TestCase):
             r = self.sp.merge("D", sub(pl("p1", "歌单", ("tx", "x"))))
             self.assertNotIn("tx:x", live_keys(self.sp, "歌单"))
             self.assertIn("tx:x", r.meta["suppressed_tracks"])
-            self.assertNotIn("tx:x", self.sp.pending_restores)
 
     # D21：确认水位 GC（第四轮 P0-B）——所有已注册客户端都**看过删除后视图**
     # （deliver 交付不含该键 → ack；merge 提交确认同样 ack）才 GC；

@@ -354,19 +354,14 @@ def _repair_engine_fields(engine) -> None:
         engine.order_changed_at = None
     if not hasattr(engine, "sort_tag"):
         engine.sort_tag = 0
-    # 第四轮引擎策略（P0-C/P1-1/P1-2）：旧 pkl 补默认值
-    # 第八轮修正：开关原名 confirm_restore，与同名方法 SyncSpace.confirm_restore(key)
-    # 撞名——旧 pkl 里缺这个实例属性时 hasattr() 摸到的是方法（恒为真）⇒ 默认值永远补不上，
-    # `_note_restore` 又会把绑定方法当真值 ⇒ 恢复卡照旧产生；而一旦实例里真的写入 bool，
-    # 又会遮住方法，使确认恢复接口 `eng.confirm_restore(key)` 报 'bool' object is not callable。
-    # 故：清掉遗留的同名 bool，改用新名 restore_cards_enabled。
-    if isinstance(engine.__dict__.get("confirm_restore"), bool):
-        engine.__dict__.pop("confirm_restore", None)
-    if not hasattr(engine, "restore_cards_enabled"):
-        engine.restore_cards_enabled = False
-    # 第八轮：批量删除也不再有"待确认删除"卡（用户 2026-10-08「不要再弹确认了」）
-    if not hasattr(engine, "delete_cards_enabled"):
-        engine.delete_cards_enabled = False
+    # 第四轮引擎策略（P0-C/P1-2）：旧 pkl 补默认值。
+    # D33（2026-10-08）：确认卡通道整体移除——旧 pkl 里遗留的
+    # pending_deletions/pending_restores/confirm_restore(bool)/restore_cards_enabled/
+    # delete_cards_enabled 一律清掉（confirm_restore 曾经是实例 bool 会遮住同名方法，
+    # 第八轮历史坑；现在方法也没了，清掉纯防脏数据跟着序列化）。
+    for _legacy in ("pending_deletions", "pending_restores",
+                    "confirm_restore", "restore_cards_enabled", "delete_cards_enabled"):
+        engine.__dict__.pop(_legacy, None)
     if not hasattr(engine, "trusted_direct_delete"):
         engine.trusted_direct_delete = True
     if not hasattr(engine, "restore_grace_seconds"):

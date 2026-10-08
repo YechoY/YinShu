@@ -118,7 +118,6 @@ class MultiDeviceEngineTest(unittest.TestCase):
         self.assertNotIn("tx:s", flat_removed)
         flat_never = [k for ks in r.meta["never_owned"]["tracks"].values() for k in ks]
         self.assertIn("tx:s", flat_never)
-        self.assertFalse(r.meta["never_owned_applied"])
         self.assertIn("tx:s", canon_keys(sp, A.client_id))      # 仍在
         self.assertNotIn("tx:s", sp.tombstones)                 # 不写墓碑
 
@@ -371,7 +370,6 @@ class MultiDeviceEngineTest(unittest.TestCase):
         self.assertEqual(r.meta["never_owned"]["playlists"], [])
         self.assertIn(p2, canon_playlists(sp, A.client_id))   # 仍存活
         self.assertNotIn(p2, sp.tombstones)
-        self.assertFalse(sp.pending_deletions)                # 无确认卡
         self.assertEqual(sp.revision, rev)                    # 无删除 ⇒ revision 不动
         # 澜音照常提交带 p2 → 正常保留（没有任何人删过它）
         r2 = sp.merge(CE.client_id, {"playlists": [
@@ -398,7 +396,6 @@ class MultiDeviceEngineTest(unittest.TestCase):
         self.assertTrue(r.meta["suspects"])
         flat = [k for ks in r.meta["suspects"].values() if isinstance(ks, list) for k in ks]
         self.assertIn("wy:y", flat)
-        self.assertFalse(sp.pending_deletions)       # 不出卡
         self.assertIn("wy:y", canon_keys(sp, A.client_id))   # 不删
 
     # ---- 第四轮 P0-C：同空间成员互信，B 直接删除（无确认卡）后，A（曾提交者）
@@ -406,7 +403,7 @@ class MultiDeviceEngineTest(unittest.TestCase):
     #      ——"看过删除结果 + 冷静期已过"视为用户意图恢复，直接生效清墓碑 ----
     #      第七轮：删除必须由"曾提交过 p1"的设备发起（owned 缺席才是删除意图），
     #      否则 B 的缺席只会被记成 never_owned、删不掉任何东西。
-    def test_other_device_residue_after_confirm_delete_restores(self):
+    def test_other_device_residue_after_bulk_delete_restores(self):
         sp = self._space()
         A = self._dev(sp, "d-a")                      # 栖弦（can_delete=True）
         B = self._dev(sp, "d-b")
@@ -422,8 +419,7 @@ class MultiDeviceEngineTest(unittest.TestCase):
         # B 提交缺 p1（B 提交过它 = owned）⇒ 判删、写墓碑
         r = sp.merge(B.client_id, sub([("kw", "0")], nid="p2", name="其他"))
         self.assertIn(pl_id, r.meta["removed_playlists"])
-        self.assertFalse(sp.pending_deletions)        # 无确认卡
-        self.assertIn(pl_id, sp.tombstones)           # 直接写墓碑
+        self.assertIn(pl_id, sp.tombstones)           # 直接写墓碑（无卡，D33）
         # A GET 跨过删除点（base_served 推进到删除后 revision）
         sp.deliver(A.client_id)
         # A 本地残留回推（提交视图仍带 p1+x）→ 第四轮 P0-C：看过删除结果 + 冷静期已过
@@ -431,7 +427,6 @@ class MultiDeviceEngineTest(unittest.TestCase):
         r2 = sp.merge(A.client_id, sub([("tx", "x")], nid="p1", name="歌单"))
         self.assertIn(pl_id, canon_playlists(sp, A.client_id))
         self.assertNotIn(pl_id, sp.tombstones)
-        self.assertNotIn(pl_id, sp.pending_restores)   # 无待确认恢复卡
 
     # ---- 第四轮 P0-C：没看过删除结果的残留回推（stale 客户端）仍被压制 ----
     def test_stale_client_readd_still_suppressed(self):
@@ -510,7 +505,6 @@ class MultiDeviceEngineTest(unittest.TestCase):
         r = sp.merge(CE.client_id, {"playlists": [
             {"native_id": "p2", "name": "澜音单", "tracks": [{"source": "wy", "songId": "7"}]}]})
         self.assertIn(pl1, r.meta["never_owned"]["playlists"])
-        self.assertFalse(r.meta["never_owned_applied"])
         self.assertNotIn(pl1, sp.tombstones)
         self.assertIn(pl1, canon_playlists(sp, A.client_id))   # p1 仍存活
 
@@ -529,7 +523,6 @@ class MultiDeviceEngineTest(unittest.TestCase):
         self.assertNotIn("tx:1", r.meta.get("suppressed_tracks", []))
         self.assertIn("tx:1", canon_keys(sp, B.client_id))
         self.assertNotIn("tx:1", sp.tombstones)
-        self.assertNotIn("tx:1", sp.pending_restores)   # 无待确认恢复卡
 
     # ---- 第十二轮（2026-10-08 真机：洛雪删掉的歌在栖弦里删不掉，最后还被"显式恢复"复活）----
     # 现场序列（journal）：09:11:14 栖弦加歌并置顶 → 09:12:05 洛雪整份 PUT 删掉它（写墓碑）
@@ -587,8 +580,8 @@ class MultiDeviceEngineTest(unittest.TestCase):
         self.assertNotIn("tx:k9", canon_keys(sp, A.client_id))
         self.assertIn("tx:k9", sp.tombstones)
 
-    # ---- 第四轮 P1-2 / 第八轮：untrusted（无删除能力）端点批量删除 ----
-    def test_untrusted_bulk_delete_still_deferred(self):
+    # ---- 第四轮 P1-2 / D33：untrusted（无删除能力）端点批量删除 → withheld ----
+    def test_untrusted_bulk_delete_withheld(self):
         sp = self._space()
         sp.restore_grace_seconds = 0
         L = sp.register_client("acct:ceru-plugin:default", dialect="ceru-plugin",
@@ -601,10 +594,8 @@ class MultiDeviceEngineTest(unittest.TestCase):
         r = sp.merge(L.client_id, {"playlists": [
             {"native_id": "p1", "name": "歌单",
              "tracks": [{"source": "tx", "songId": "0"}]}]})
-        # 第八轮：安全阀默认不弹卡（deferred 空、无 pending），也不应用（条目保留、不写墓碑），
-        # 只在 meta.safety_valve.withheld 留痕。
-        self.assertFalse(r.meta["deferred"])
-        self.assertFalse(sp.pending_deletions)
+        # D33：安全阀永不弹卡——不应用（条目保留、不写墓碑），只在
+        # meta.safety_valve.withheld 留痕。
         self.assertTrue(r.meta["safety_valve"]["withheld"])
         self.assertIsNone(r.meta["safety_valve"]["applied"])
         self.assertEqual(len(sp.tombstones), 0)                # 未写墓碑

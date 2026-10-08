@@ -235,26 +235,21 @@ class TestMergeEngine(unittest.TestCase):
         self.assertEqual(self.sp.revision, rev_before)
         self.assertIs(self.sp.clients["A"].base_submitted, sub_before)
 
-    # 用例 14：删除比例 80% → 安全阀（不可信端点）：新增照常、删除挂起且不写墓碑、渲染仍含、200、待确认
-    # （第四轮 P1-2：trusted_direct_delete=False 时恢复旧安全阀行为；可信客户端默认直删，见 test_14b）
+    # 用例 14：删除比例 80% → 安全阀（不可信端点）：新增照常、该批删除不生效不写墓碑、渲染仍含、200
+    # （D33：确认卡通道已整体移除；不可信端 withholding 由 meta.safety_valve 留痕）
     def test_14_safety_valve_80_percent(self):
         self.sp.trusted_direct_delete = False
-        self.sp.delete_cards_enabled = True    # 第八轮默认 False（永不挂卡）；这里显式测旧安全阀通道
         tracks = [("tx", f"t{i}") for i in range(12)]
         self.sp.merge("A", sub(pl("p1", "歌单", *tracks)))
         self.sp.deliver("A")
-        # A 删 11 首（11/12=91.7% ≥50% 且 ≥10）→ 挂起
+        # A 删 11 首（11/12=91.7% ≥50% 且 ≥10）→ withheld
         r = self.sp.merge("A", sub(pl("p1", "歌单", ("tx", "t0"))))
         self.assertEqual(r.status, 200)
-        self.assertTrue(r.meta["deferred"])
-        self.assertTrue(self.sp.pending_deletions)
+        self.assertTrue(r.meta["safety_valve"]["withheld"])
+        self.assertIsNone(r.meta["safety_valve"]["applied"])
         # 删除未写墓碑，渲染仍含全部曲目（D4）
         self.assertEqual(len(live_track_keys(self.sp, pl_id_of(self.sp, "歌单"))), 12)
         self.assertEqual(len(self.sp.tombstones), 0)
-        # 用户确认后才真正删除
-        pid = next(iter(self.sp.pending_deletions))
-        self.sp.confirm_delete(pid)
-        self.assertEqual(live_track_keys(self.sp, pl_id_of(self.sp, "歌单")), {"tx:t0"})
 
     # 用例 14b：可信客户端批量删除直接生效（第四轮 P1-2，trusted_direct_delete 默认 True）
     def test_14b_trusted_bulk_delete_applies_without_pending(self):
@@ -263,28 +258,21 @@ class TestMergeEngine(unittest.TestCase):
         self.sp.deliver("A")
         r = self.sp.merge("A", sub(pl("p1", "歌单", ("tx", "t0"))))
         self.assertEqual(r.status, 200)
-        self.assertFalse(r.meta["deferred"])          # 可信直删：不挂起
-        self.assertFalse(self.sp.pending_deletions)   # 无确认卡
         self.assertEqual(live_track_keys(self.sp, pl_id_of(self.sp, "歌单")), {"tx:t0"})
 
-    # 用例 14c（§4.1 点名）：trusted_direct_delete=False 恢复旧安全阀语义
-    # （不可信端点/开关关闭时，批量删除仍挂起待确认，与 test_14 行为一致）
-    def test_trusted_direct_delete_off_restores_old_valve(self):
+    # 用例 14c（§4.1 点名）：trusted_direct_delete=False 时可信客户端批量删除也 withheld
+    # （D33 后安全阀只剩两条分支：可信直删 / 不可信（含开关关闭）不生效不写墓碑）
+    def test_trusted_direct_delete_off_withholds_bulk_delete(self):
         self.sp.trusted_direct_delete = False
-        self.sp.delete_cards_enabled = True
         tracks = [("tx", f"t{i}") for i in range(12)]
         self.sp.merge("A", sub(pl("p1", "歌单", *tracks)))
         self.sp.deliver("A")
-        # 可信客户端删 11/12 → 开关关 → 旧语义：挂起、不写墓碑、渲染仍含全部
+        # 可信客户端删 11/12 → 开关关 → 不生效、不写墓碑、渲染仍含全部
         r = self.sp.merge("A", sub(pl("p1", "歌单", ("tx", "t0"))))
         self.assertEqual(r.status, 200)
-        self.assertTrue(r.meta["deferred"])
-        self.assertTrue(self.sp.pending_deletions)
+        self.assertTrue(r.meta["safety_valve"]["withheld"])
         self.assertEqual(len(live_track_keys(self.sp, pl_id_of(self.sp, "歌单"))), 12)
         self.assertEqual(len(self.sp.tombstones), 0)
-        # 确认后才真删
-        self.sp.confirm_delete(next(iter(self.sp.pending_deletions)))
-        self.assertEqual(live_track_keys(self.sp, pl_id_of(self.sp, "歌单")), {"tx:t0"})
 
     # 用例 15：未知方言 → 隔离保存，其它客户端不受影响
     def test_15_unknown_dialect_isolated(self):
@@ -346,7 +334,6 @@ class TestMergeEngine(unittest.TestCase):
         self.sp.merge("R", sub(pl("p1", "歌单", ("tx", "x"))))  # 缺 wy:y
         self.sp.deliver("R")
         self.assertEqual(live_track_keys(self.sp, pl_id_of(self.sp, "歌单")), {"tx:x", "wy:y"})
-        self.assertFalse(self.sp.pending_deletions)
 
     # 用例 20：三客户端交错 GET/PUT。第七轮：删除只认"自己提交过"（owned）的缺席——
     # A 先整段提交 p1+p2+p3（进入 owned 水位），再回写只剩 p1 的旧段 → p2/p3 缺席即删
@@ -380,7 +367,6 @@ class TestMergeEngine(unittest.TestCase):
         self.assertEqual(live_track_keys(self.sp, pl_id_of(self.sp, "歌单乙")), {"wy:y"})
         jb2 = next(pl for pl in self.sp.playlists.values() if pl.name == "歌单丙")
         self.assertIsNotNone(jb2.deleted_at)   # p3 未被回推，仍处于已删状态
-        self.assertFalse(self.sp.pending_restores)   # 全程无待确认卡
 
     # 用例 21：客户端只 GET 不 PUT → 无基线 GET 404（P0-1），不产生删除、不推进基线
     def test_21_get_only_no_delete(self):
@@ -408,7 +394,6 @@ class TestMergeEngine(unittest.TestCase):
         self.sp.merge("R", sub(pl("p1", "歌单")))  # 空视图
         self.sp.deliver("R")
         self.assertEqual(len(live_track_keys(self.sp, pl_id_of(self.sp, "歌单"))), 10)
-        self.assertFalse(self.sp.pending_deletions)
 
     # 用例 23：离线 90 天后回归 → 不复活、不误删（base_served 水位 + 墓碑压制）
     def test_23_offline_return_no_revive(self):
@@ -469,7 +454,6 @@ class TestMergeEngine(unittest.TestCase):
         self.sp.deliver("D")
         self.assertEqual(live_track_keys(self.sp, pl_id_of(self.sp, "歌单")), {"wy:y"})
         self.assertIn("tx:x", r.meta["suppressed_tracks"])
-        self.assertNotIn("tx:x", self.sp.pending_restores)   # 无待确认恢复卡
         # 再次提交同一视图 → 幂等压制，不复活
         self.sp.merge("D", sub(pl("p1", "歌单", ("tx", "x"), ("wy", "y"))))
         self.assertEqual(live_track_keys(self.sp, pl_id_of(self.sp, "歌单")), {"wy:y"})
@@ -484,7 +468,6 @@ class TestMergeEngine(unittest.TestCase):
         self.sp.deliver("A")
         self.assertEqual(live_track_keys(self.sp, pl_id_of(self.sp, "歌单")), {"tx:x"})
         self.assertNotIn("tx:x", self.sp.tombstones)
-        self.assertNotIn("tx:x", self.sp.pending_restores)
 
     # 排序同步：歌单内顺序在 merge + deliver 全链路保留（kg → tx → wy，不被 key 排序打乱）
     def test_order_preserved_through_merge_and_deliver(self):

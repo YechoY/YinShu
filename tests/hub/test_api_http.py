@@ -346,18 +346,15 @@ class ApiHttpTest(unittest.TestCase):
         self.assertEqual(st, 200)
         self.assertEqual(state["revision"], 1)        # 新增空歌单也推进 revision
 
-    # ---- P1-1：确认通道路由存在且幂等 ----
-    def test_09_pending_confirm_routes(self):
+    # ---- D33：确认通道端点已整体移除（路由不复存在、state 不再带 pending 字段） ----
+    def test_09_pending_routes_removed(self):
         c = _Client(self.base, "alice", "pw1")
         st, _, body = c.get("/api/state")
         self.assertEqual(st, 200)
-        self.assertIn("pendingDeletions", body)
-        self.assertIn("pendingRestores", body)
-        # 不存在的 id → 404（幂等，不炸）；PUT 到 POST 路由 → 4xx（FastAPI 版本相关，404/405 均可）
-        st2, _, _ = c.put("/api/pending-deletions/nope/confirm", {})
-        self.assertIn(st2, (404, 405))
-        st3, _, _ = c.post("/api/pending-deletions/nope/confirm")
-        self.assertEqual(st3, 404)
+        self.assertNotIn("pendingDeletions", body)
+        self.assertNotIn("pendingRestores", body)
+        st2, _, _ = c.post("/api/pending-deletions/nope/confirm")
+        self.assertEqual(st2, 404)   # 路由已拆除（D33）
 
     # ---- S15 语义：删除传播后，无删除能力端（澜音）推回被墓碑压住 ----
     def test_10_deletion_not_pushed_back_by_can_delete_false(self):
@@ -377,15 +374,12 @@ class ApiHttpTest(unittest.TestCase):
         _, _, lb = lan.get("/ceru/sync-v1.json")
         song_ids = {t.get("songId") for pl in lb["playlists"] for t in pl["tracks"]}
         self.assertNotIn("2", song_ids)
-        # 澜音（本地删不掉）推回 tx2 → 墓碑压制，栖弦视图不复活 + 进待确认恢复
+        # 澜音（本地删不掉）推回 tx2 → 墓碑压制，栖弦视图不复活（D33：不再有恢复卡）
         lan.put("/ceru/sync-v1.json",
                 ceru_payload([{"id": "ceru-d", "name": "删",
                                "tracks": [("tx", "1", "歌A"), ("tx", "2", "歌B")]}]))
         _, _, cb = c.get("/CyShineMusic/sync-v1.json")
         self.assertNotIn("tx_2", _cyshine_tracks(cb)["d1"])   # 被压制，不复活
-        st, _, state = c.get("/api/state")
-        self.assertEqual(st, 200)
-        self.assertFalse(state["pendingRestores"])            # 无待确认恢复卡
 
     # ===== 多账户共用歌单修改文档 §1：opaque 按客户端隔离 =====
     def test_11_opaque_isolated_between_clients(self):
@@ -431,18 +425,14 @@ class ApiHttpTest(unittest.TestCase):
         lan = _Client(self.base, "alice", "pw1")
         lan.put("/ceru/sync-v1.json", ceru_payload([{"id": "ceru-y", "name": "Y", "tracks": []}]))
         c.get("/CyShineMusic/sync-v1.json")
-        # 第一轮：栖弦提交不含 y → 直接删除写墓碑，不出卡
+        # 第一轮：栖弦提交不含 y → 直接删除写墓碑（D33：无卡、无 pending 通道）
         c.put("/CyShineMusic/sync-v1.json", cyshine_payload([{"id": "x", "name": "X", "tracks": []}]))
-        _, _, state = c.get("/api/state")
-        self.assertEqual(state["pendingDeletions"], [])     # 无确认卡
         _, _, body = c.get("/CyShineMusic/sync-v1.json")
         ids = [p["id"] for p in body["sections"]["playlists"]["data"]]
         self.assertNotIn("y", ids)                          # y 已被删除
-        # 第二轮：同样缺 y → 幂等（已删，无变化、无卡）
+        # 第二轮：同样缺 y → 幂等（已删，无变化）
         c.put("/CyShineMusic/sync-v1.json", cyshine_payload([{"id": "x", "name": "X", "tracks": []}]))
-        _, _, state = c.get("/api/state")
-        self.assertEqual(state["pendingDeletions"], [])
-        # 第三轮：删除者本人 GET 跨过删除点后把 y 带回 → 显式恢复直接生效（无卡）
+        # 第三轮：删除者本人 GET 跨过删除点后把 y 带回 → 显式恢复直接生效
         # （第四轮 P0-C：测试内关闭冷静期——真实时间下删除与恢复间隔 < 冷静期。
         #  第十三轮踩坑：直接改 engine.restore_grace_seconds 会被 policy_hook 在**下一次
         #  Hub.get()** 按 _policy 冲回 120——本行原写法就是这样静默失效的，D32 之后
@@ -453,56 +443,10 @@ class ApiHttpTest(unittest.TestCase):
         c.put("/CyShineMusic/sync-v1.json",
               cyshine_payload([{"id": "x", "name": "X", "tracks": []},
                                {"id": "y", "name": "Y", "tracks": []}]))
-        _, _, state = c.get("/api/state")
-        self.assertEqual(state["pendingDeletions"], [])   # 无卡
         _, _, body = c.get("/CyShineMusic/sync-v1.json")
         ids = [p["id"] for p in body["sections"]["playlists"]["data"]]
         self.assertIn("y", ids)                           # y 已恢复
         api._policy["restore_grace_seconds"] = 120
-        api._apply_engine_policy()
-
-    def test_13_pending_card_only_owner_can_confirm(self):
-        """确认卡只能由发起账号（或 admin）处理；bob 确认 alice 的卡 → 403。
-        （安全阀卡：批量删除触发 D4 挂起，仍保留确认流程）"""
-        # 本测试内 bob 与 alice 同空间 main（bob 为普通账号）
-        api.configure(self.hub, {
-            "alice": {"password": api._hash_pw("pw1"), "space": "main",
-                      "role": "admin", "enabled": True},
-            "bob": {"password": api._hash_pw("pw2"), "space": "main",
-                    "role": "user", "enabled": True},
-        }, config_path=None)
-        alice = _Client(self.base, "alice", "pw1")
-        bob = _Client(self.base, "bob", "pw2")
-        # 第四轮 P1-2 / 第十轮 D27：本测试要构造"旧安全阀卡"，需显式打开旧通道
-        # （默认 confirm_delete=False + trusted_direct_delete=True → 批量删除直接生效、不挂卡）。
-        # 注意：这两个引擎开关由 policy_hook 按 _policy 重设，直接改 engine 属性会在下一次
-        # Hub.get() 时被冲掉（第十轮踩坑），所以只能改 policy。
-        api._policy["confirm_delete"] = True
-        api._policy["trusted_direct_delete"] = False
-        api._apply_engine_policy()
-        # 构造 alice 的安全阀卡：提交 12 首 → 删 11 首（91.7% ≥50% 且 ≥10）→ 挂起
-        alice.put("/CyShineMusic/sync-v1.json",
-                  cyshine_payload([{"id": f"t{i}", "name": f"T{i}",
-                                    "tracks": [("tx", f"{i}", f"T{i}-1")]}
-                                   for i in range(12)]))
-        alice.get("/CyShineMusic/sync-v1.json")
-        alice.put("/CyShineMusic/sync-v1.json",
-                  cyshine_payload([{"id": "t0", "name": "T0",
-                                    "tracks": [("tx", "0", "T0-1")]}]))
-        _, _, state = alice.get("/api/state")
-        cards = state["pendingDeletions"]
-        self.assertEqual(len(cards), 1)
-        pid = cards[0]["id"]
-        self.assertEqual(cards[0]["account"], "alice")
-        # bob（非 owner 非 admin）确认 → 403
-        st, _, _ = bob.post(f"/api/pending-deletions/{pid}/confirm")
-        self.assertEqual(st, 403)
-        # alice（owner + admin）确认 → 200
-        st2, _, _ = alice.post(f"/api/pending-deletions/{pid}/confirm")
-        self.assertEqual(st2, 200)
-        # 还原默认策略，别把旧通道漏给后面的用例
-        api._policy["confirm_delete"] = False
-        api._policy["trusted_direct_delete"] = True
         api._apply_engine_policy()
 
     # ===== 多账户共用歌单修改文档 §3：空间管理 =====

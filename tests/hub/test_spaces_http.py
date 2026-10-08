@@ -178,7 +178,6 @@ class SpacesHttpTest(unittest.TestCase):
         self.assertEqual(self.b.put("/CyShineMusic/sync-v1.json",
                                     cyshine_payload([]))[0], 403)
         self.assertEqual(self.b.delete("/api/playlists/p1")[0], 403)
-        self.assertEqual(self.b.post("/api/pending-deletions/nope/confirm")[0], 403)
 
     # ---- 6：邀请码加入后歌单互通 ----
     def test_06_invite_join_flow(self):
@@ -541,21 +540,15 @@ class SpacesHttpTest(unittest.TestCase):
         self.assertEqual(self.b.put("/CyShineMusic/sync-v1.json",
                                     cyshine_payload([{"id": "p1", "name": "家",
                                                       "tracks": [("tx", "1", "歌A")]}]))[0], 200)
-        # bob 删除歌 → 直删（互信）→ /api/state 无 pending_deletions
+        # bob 删除歌 → 直删（互信；D33：无 pending 通道）
         self.b.get("/CyShineMusic/sync-v1.json")
         self.assertEqual(self.b.put("/CyShineMusic/sync-v1.json",
                                     cyshine_payload([]))[0], 200)
-        st, _, state = self.a.get("/api/state")
-        self.assertEqual(st, 200)
-        self.assertEqual(state.get("pendingDeletions"), [])
-        # bob 看过删除视图后重加 → 冷静期（默认 120s）内按残留压制（无卡、不复活）
+        # bob 看过删除视图后重加 → 冷静期（默认 120s）内按残留压制（不复活）
         self.b.get("/CyShineMusic/sync-v1.json")
         self.assertEqual(self.b.put("/CyShineMusic/sync-v1.json",
                                     cyshine_payload([{"id": "p1", "name": "家",
                                                       "tracks": [("tx", "1", "歌A")]}]))[0], 200)
-        st2, _, state2 = self.a.get("/api/state")
-        self.assertEqual(st2, 200)
-        self.assertEqual(state2.get("pendingRestores"), [])   # P1-1：不再产生恢复卡
         _, _, body = self.b.get("/CyShineMusic/sync-v1.json")
         ids = [pl["id"] for pl in body["sections"]["playlists"]["data"]]
         self.assertNotIn("p1", ids)   # 冷静期内回推被压制，不复活（§2.4.3-②）

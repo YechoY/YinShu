@@ -300,43 +300,6 @@ export async function deleteTrack(token, plId, key) {
   return parseOrThrow(r);
 }
 
-/* P1-1 确认通道：安全阀挂起删除 / 墓碑压制恢复（docs/05 §5.3.5） */
-export async function confirmPendingDelete(token, id) {
-  const r = await fetch("/api/pending-deletions/" + encodeURIComponent(id) + "/confirm", {
-    method: "POST",
-    headers: { Authorization: "Basic " + token, "Content-Type": "application/json" },
-    body: "{}",
-  });
-  return parseOrThrow(r);
-}
-
-export async function rejectPendingDelete(token, id) {
-  const r = await fetch("/api/pending-deletions/" + encodeURIComponent(id) + "/reject", {
-    method: "POST",
-    headers: { Authorization: "Basic " + token, "Content-Type": "application/json" },
-    body: "{}",
-  });
-  return parseOrThrow(r);
-}
-
-export async function confirmPendingRestore(token, key) {
-  const r = await fetch("/api/pending-restores/" + encodeURIComponent(key) + "/confirm", {
-    method: "POST",
-    headers: { Authorization: "Basic " + token, "Content-Type": "application/json" },
-    body: "{}",
-  });
-  return parseOrThrow(r);
-}
-
-export async function rejectPendingRestore(token, key) {
-  const r = await fetch("/api/pending-restores/" + encodeURIComponent(key) + "/reject", {
-    method: "POST",
-    headers: { Authorization: "Basic " + token, "Content-Type": "application/json" },
-    body: "{}",
-  });
-  return parseOrThrow(r);
-}
-
 /* ---- 格式化 ---- */
 export function pad(n) { return String(n).padStart(2, "0"); }
 

@@ -74,7 +74,7 @@ class MergeResult:
     status: int
     view: Dict[str, dict]                        # 渲染给客户端的视图（canonical 真值）
     pending_cleanup: List[dict] = field(default_factory=list)
-    meta: dict = field(default_factory=dict)     # added/removed/suspects/deferred/restores
+    meta: dict = field(default_factory=dict)     # added/removed/suspects/safety_valve/never_owned
     canonical_mutated: bool = False
     stamp: str = ""                              # P0-2：本次交付的确定性 modifiedAt
 
@@ -114,24 +114,11 @@ class SyncSpace:
         self.playlist_aliases: Dict[Tuple[str, str], str] = {}  # (dialect, native_id) -> pl_id
         self.clients: Dict[str, Client] = {}
         self.journal: List[dict] = []
-        self.pending_deletions: Dict[str, dict] = {}  # 待确认删除（安全阀挂起）
-        self.pending_restores: Dict[str, dict] = {}   # 待确认恢复（墓碑压制；P1-1 默认关闭）
         self.quarantine: Dict[str, dict] = {}         # 未知方言隔离容器（D11）
-        # 第四轮引擎策略（可被 policy 覆盖，_repair_engine_fields 兜底默认值）：
-        # 第八轮修正：这个开关**不能**叫 confirm_restore——它与同名方法
-        # SyncSpace.confirm_restore(key)（见本文件末尾的确认通道）撞名：
-        #   ① 旧 pkl 里没有该实例属性时 hasattr() 会摸到方法（恒为真），
-        #      `_repair_engine_fields` 因此永远补不上默认值，`_note_restore` 里
-        #      `if not self.confirm_restore` 拿到的是绑定方法（真值）→ 恢复卡照旧产生；
-        #   ② 一旦实例真的写入 bool，又会遮住方法，使 /api/pending-restores/{key}/confirm
-        #      调用 `eng.confirm_restore(key)` 报 "'bool' object is not callable"。
-        # 故改名为 restore_cards_enabled，并在加载时清掉遗留的同名 bool。
-        self.restore_cards_enabled: bool = False      # P1-1：默认不再产生待确认恢复卡
-        # 第八轮（2026-10-08 用户拍板「不要再弹确认了」）：批量删除安全阀**不再产生确认卡**。
-        # False（默认）三分支见 merge()：可信端直删生效（meta.safety_valve.applied）、
-        # 不可信端既不生效也不出卡（meta.safety_valve.withheld）；
-        # True 才回到旧行为（超阈值 → 挂起 → 产生"待确认删除"卡 → 前端 PendingCard 弹确认）。
-        self.delete_cards_enabled: bool = False
+        # 第四轮引擎策略（可被 policy 覆盖，_repair_engine_fields 兜底默认值）。
+        # D33（2026-10-08）：确认卡通道（pending_deletions/pending_restores、
+        # delete_cards_enabled/restore_cards_enabled）整体移除——用户拍板
+        # 「同一个账户接入的就是可信的」，安全阀只留两条分支：可信直删 / 不可信 withheld。
         self.trusted_direct_delete: bool = True       # P1-2：可信客户端批量删除直接生效
         self.restore_grace_seconds: Optional[float] = None  # P0-C：None=用类常量
         # P0-2：确定性交付——内容（增删）真变时刻与排序真变时刻分离；
@@ -582,86 +569,6 @@ class SyncSpace:
             return False   # 冷静期内：仍按残留压制
         return True
 
-    def _note_restore(self, kind: str, key: str, now: str,
-                      context: Optional[str] = None,
-                      tracks: Optional[List[str]] = None,
-                      name: Optional[str] = None,
-                      client_id: Optional[str] = None) -> None:
-        """登记一条"待确认恢复"候选（墓碑压制，I7/D20）。同 key 合并上下文。
-
-        **第四轮 P1-1**：默认（restore_cards_enabled=False）不再产生待确认恢复卡——
-        抑制信息由 merge meta 的 suppressed_playlists/suppressed_tracks 承载，
-        重加要么被墓碑压制、要么越冷静期后直接显式恢复，不需要人工确认。
-        仅当 policy.confirm_restore=True（旧行为开关，落到引擎字段
-        restore_cards_enabled；第八轮改名，原字段名与同名方法撞名，见 __init__）时
-        才写 pending_restores。
-
-        多账户共用歌单 §2：补记发起客户端/账号（确认卡只能由本人/admin 处理，
-        前端可显示"来自：<账号>"）。同 key 已存在时不覆盖发起者（先到先记）。
-        """
-        if not self.restore_cards_enabled:
-            return
-        rec = self.pending_restores.get(key)
-        if rec is None:
-            rec = {"kind": kind, "key": key,
-                   "reason": "身份不可信的重加被墓碑压制", "at": now}
-            self.pending_restores[key] = rec
-        if client_id is not None:
-            rec.setdefault("client", client_id)
-            rec.setdefault("account", client_id.split(":", 1)[0])
-        if kind == "track":
-            rec.setdefault("playlists", [])
-            if context is not None and context not in rec["playlists"]:
-                rec["playlists"].append(context)
-        else:
-            rec["tracks"] = tracks or []
-            rec["name"] = name
-
-    def _upsert_pending_deletion(self, client_id: str, reason: str,
-                                 playlists: Set[str], tracks: Dict[str, Set[str]],
-                                 now: str) -> str:
-        """待确认删除卡的**去重/合并**（多账户共用歌单 §2）：
-
-        同一客户端 + 同一 reason 的未处理卡 → 复用旧 pid，把新的 playlists/tracks
-        并入（并集），只更新 created_at；找不到 → 新建（带 account 归属字段）。
-        """
-        for pid, card in self.pending_deletions.items():
-            if card.get("client") == client_id and card.get("reason") == reason:
-                card["playlists"] |= playlists
-                for pl, ks in tracks.items():
-                    card["tracks"].setdefault(pl, set())
-                    card["tracks"][pl] |= ks
-                card["created_at"] = now
-                return pid
-        pid = new_ulid("del")
-        self.pending_deletions[pid] = {
-            "space": self.space_id, "client": client_id, "reason": reason,
-            "account": client_id.split(":", 1)[0],
-            "playlists": set(playlists),
-            "tracks": {pl: set(ks) for pl, ks in tracks.items()},
-            "created_at": now,
-        }
-        return pid
-
-    def _close_pending_deletions(self, client_id: str, view: Dict[str, dict]) -> None:
-        """自动关闭（多账户共用歌单 §2）：本次提交**又带回了**卡里的条目
-        （歌单重新出现 / 曲目 key 重新出现）→ 用户不删了，卡应该消失。
-        只关**本客户端**发起的卡，不影响别的客户端/管理员。
-        """
-        if not self.pending_deletions:
-            return
-        submitted_keys = {k for e in view.values() for k in e["tracks"]}
-        for pid, card in list(self.pending_deletions.items()):
-            if card.get("client") != client_id:
-                continue
-            pls = card.get("playlists") or set()
-            trs = card.get("tracks") or {}
-            if pls and not pls.isdisjoint(view.keys()):
-                self.pending_deletions.pop(pid, None)
-                continue
-            if trs and any(k in submitted_keys for ks in trs.values() for k in ks):
-                self.pending_deletions.pop(pid, None)
-
     # ---- 安全阀 -----------------------------------------------------------
     def _safety_trigger(self, removed_pl: Set[str], removed_t: Dict[str, Set[str]]) -> bool:
         live_pl = [p for p in self.playlist_order if self.playlists[p].deleted_at is None]
@@ -707,10 +614,9 @@ class SyncSpace:
 
         if not isinstance(submission, dict):
             return MergeResult(status=400, view={}, meta={"error": "submission 必须是对象"})
-        if submission.get("create_only") and client.base_submitted is not None:
-            # createOnly（If-None-Match: * 语义，用例 25）：文件已存在 → 按基线合并（docs/03:88，
-            # 栖弦把 412 当失败会整轮重跑；本阶段绝不主动回 412）
-            pass
+        # createOnly（If-None-Match: * 语义，用例 25）：文件已存在 → 按基线合并（docs/03:88，
+        # 栖弦把 412 当失败会整轮重跑；本阶段绝不主动回 412）——引擎对基线存在的
+        # createOnly 提交不做任何特殊处理，直接走正常合并。
         if client.dialect not in self.KNOWN_DIALECTS:
             # 未知方言隔离（D11）：不参与跨格式合并，其它客户端不受影响
             self.quarantine[client_id] = {"payload": submission, "first_seen": now}
@@ -834,17 +740,14 @@ class SyncSpace:
         no_pl = set(never_owned_pl)
         no_t = {pl: set(ks) for pl, ks in never_owned_t.items() if ks}
 
-        # 安全阀（I5）：单次删除超阈值 → 挂起该批删除，其余照常应用。
+        # 安全阀（I5）：单次删除超阈值 → 其余照常应用，该批删除按信任分流。
         # **第四轮 P1-2**：trusted_direct_delete 空间配置（默认 True）——可信客户端
-        # （身份已验证 + 有删除能力 + 未退休，即同空间互信的栖弦）批量删除直接生效，
-        # 不再挂起确认卡；只有不可信/无删除能力的端点（如澜音、匿名）仍走安全阀挂起。
-        # **第八轮（2026-10-08 用户拍板「不要再弹确认了」）**：delete_cards_enabled=False
-        # （默认）时安全阀**永不产生"待确认删除"卡**。三分支：
+        # （身份已验证 + 有删除能力 + 未退休，即同空间互信的栖弦）批量删除直接生效。
+        # **第八轮（2026-10-08 用户拍板「不要再弹确认了」）**：安全阀不再挂起。
+        # **D33（2026-10-08）**：确认卡通道整体移除（同账号接入即为可信），只留两分支：
         #   ① 可信 + trusted_direct_delete → 直接生效（meta.safety_valve.applied 留痕）；
         #   ② 不可信端点 → **既不生效也不出卡**：它没有删除能力，可能只是"没拿到这批曲目"，
-        #      不能据此删掉别人的歌；meta.safety_valve.withheld 留痕；
-        #   ③ policy.confirm_delete=True（delete_cards_enabled）→ 回到旧的 deferred + 挂卡通道。
-        deferred = {}
+        #      不能据此删掉别人的歌；meta.safety_valve.withheld 留痕。
         applied_valve = None
         withheld_valve = None
         direct = self.trusted_direct_delete and trusted
@@ -855,11 +758,8 @@ class SyncSpace:
             }
             if direct:
                 applied_valve = batch                    # 可信直删：超阈值也直接生效
-            elif self.delete_cards_enabled:
-                deferred = batch                         # 显式开启，才回到"待确认删除"卡
             else:
-                withheld_valve = batch                   # 默认：不挂卡、也不应用
-            if not direct:
+                withheld_valve = batch                   # 不可信：不应用（D33 后已无挂卡分支）
                 removed_pl = set()
                 removed_t = {pl: set() for pl in removed_t}
 
@@ -876,9 +776,6 @@ class SyncSpace:
                         mutated = True
                 else:
                     suppressed_pl.add(pl)
-                    self._note_restore("playlist", pl, now, context=pl,
-                                       tracks=list(view[pl]["tracks"]),
-                                       name=view[pl]["name"], client_id=client_id)
                 continue
             if self._ensure_playlist(pl, view[pl]["name"], now):
                 mutated = True
@@ -903,7 +800,6 @@ class SyncSpace:
                             added_head.setdefault(pl, []).append(tr.tr_id)
                     else:
                         suppressed_t.add(key)
-                        self._note_restore("track", key, now, context=pl, client_id=client_id)
                     continue
                 tr, ch = self._add_track(key, now)
                 inserted = self._append_to_playlist(pl, tr.tr_id, now)
@@ -1015,8 +911,7 @@ class SyncSpace:
                              if ks - suppressed_t},
             "removed_tracks": {pl: sorted(ks) for pl, ks in removed_t.items() if ks},
             "suspects": suspects,
-            "deferred": deferred,
-            # 第八轮：安全阀不再弹卡，但把"超阈值的那批删除"留在 meta 里可审计
+            # 第八轮/D33：安全阀不弹卡，把"超阈值的那批删除"留在 meta 里可审计
             "safety_valve": {"applied": applied_valve, "withheld": withheld_valve},
             "suppressed_playlists": sorted(suppressed_pl),
             "suppressed_tracks": sorted(suppressed_t),
@@ -1028,23 +923,11 @@ class SyncSpace:
         self.journal.append({"client": client_id, "revision": self.revision,
                              "meta": meta, "at": now})
 
-        # 自动关闭（多账户共用歌单 §2）：本次提交带回了卡里条目 → 卡消失（本客户端的卡）
-        self._close_pending_deletions(client_id, view)
-
-        # 安全阀挂起的删除 → 待确认删除队列（docs/05 §5.3.5）；
-        # 同一 client+reason 已有未处理卡 → 复用 pid 并集合并（去重，§2）
-        if deferred and (deferred["playlists"] or deferred["tracks"]):
-            pid = self._upsert_pending_deletion(
-                client_id, None, set(deferred["playlists"]),
-                {pl: set(ks) for pl, ks in deferred["tracks"].items()}, now)
-            meta["pending_delete_id"] = pid
-        # 第七轮：never_owned 缺席一律不判删 ⇒ 永不为真。字段保留给旧客户端/前端兼容，
-        # 语义固定为 False（详见上方 never_owned 注释与 docs）。
+        # 第七轮：never_owned 缺席一律不判删（R1 保护，诊断字段，详见上方注释与 docs）
         meta["never_owned"] = {
             "playlists": sorted(no_pl),
             "tracks": {pl: sorted(ks) for pl, ks in no_t.items() if ks},
         }
-        meta["never_owned_applied"] = False
 
         view, cleanup = self.render_for(client)
         return MergeResult(status=200, view=view, pending_cleanup=cleanup,
@@ -1067,9 +950,6 @@ class SyncSpace:
             live = self._live_tombstone(pl)
             if live is not None:
                 suppressed_pl.add(pl)
-                self._note_restore("playlist", pl, now, context=pl,
-                                   tracks=sorted(view[pl]["tracks"]),
-                                   name=view[pl]["name"], client_id=client.client_id)
                 continue
             if self._ensure_playlist(pl, view[pl]["name"], now):
                 mutated = True
@@ -1081,7 +961,6 @@ class SyncSpace:
             for key in view[pl]["tracks"]:   # 保留提交顺序
                 if self._live_tombstone(key) is not None:
                     suppressed_t.add(key)
-                    self._note_restore("track", key, now, context=pl, client_id=client.client_id)
                     continue
                 tr, ch = self._add_track(key, now)
                 inserted = self._append_to_playlist(pl, tr.tr_id, now)
@@ -1182,72 +1061,6 @@ class SyncSpace:
                     c.retired = True
         except Exception:
             pass   # 退休判定失败不影响主流程
-
-    # ---- 确认通道 ---------------------------------------------------------
-    def confirm_delete(self, pending_id: str) -> MergeResult:
-        """用户确认挂起的删除 → 写墓碑、推进 revision（docs/05 §5.3.5 确认通道）。"""
-        p = self.pending_deletions.pop(pending_id, None)
-        if p is None:
-            raise KeyError(f"pending_delete {pending_id!r} 不存在")
-        now = self._now()
-        mutated = False
-        commit_revision = self.revision + 1
-        for pl in p["playlists"]:
-            self._delete_playlist(pl, now, p["client"], commit_revision)
-            mutated = True
-        for pl, keys in p["tracks"].items():
-            for key in keys:
-                self._remove_track_global(key, now, p["client"], commit_revision)
-                mutated = True
-        if mutated:
-            self.revision += 1
-            self.content_changed_at = now
-        self.journal.append({"client": p["client"], "revision": self.revision,
-                             "action": "confirm_delete", "at": now})
-        return MergeResult(status=200, view=self.render_for(self.clients[p["client"]])[0],
-                           canonical_mutated=mutated)
-
-    def reject_delete(self, pending_id: str) -> None:
-        """用户放弃挂起的删除：丢弃，条目保留（30 天未处理自动按此结案）。"""
-        self.pending_deletions.pop(pending_id, None)
-
-    def confirm_restore(self, key: str) -> None:
-        """用户确认恢复被墓碑压制的条目 → 真正加回并清墓碑（docs/05 I7/D20 确认通道）。"""
-        rec = self.pending_restores.pop(key, None)
-        now = self._now()
-        mutated = False
-        if rec is None:
-            self.tombstones.pop(key, None)
-            return
-        if rec["kind"] == "playlist":
-            if key in self.tombstones:
-                del self.tombstones[key]
-            if self._ensure_playlist(key, rec.get("name") or "", now):
-                mutated = True
-            for tk in rec.get("tracks", []):
-                if tk in self.tombstones:
-                    del self.tombstones[tk]
-                tr, ch = self._add_track(tk, now)
-                if self._append_to_playlist(key, tr.tr_id, now) or ch:
-                    mutated = True
-        else:  # track：加回记录到的歌单
-            for pl_id in rec.get("playlists", []):
-                if pl_id not in self.playlists or self.playlists[pl_id].deleted_at is not None:
-                    continue
-                if key in self.tombstones:
-                    del self.tombstones[key]
-                tr, ch = self._add_track(key, now)
-                if self._append_to_playlist(pl_id, tr.tr_id, now) or ch:
-                    mutated = True
-        if mutated:
-            self.revision += 1
-            self.content_changed_at = now
-        self.journal.append({"client": "user-confirm", "revision": self.revision,
-                             "action": "confirm_restore", "key": key, "at": now})
-
-    def reject_restore(self, key: str) -> None:
-        """用户保持删除：丢弃恢复候选，墓碑保留。"""
-        self.pending_restores.pop(key, None)
 
     # ---- UI 权威操作（网页管理端） ----------------------------------------
     def reorder_playlists(self, order: List[str], origin: str = "ui") -> None:

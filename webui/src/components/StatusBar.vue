@@ -44,7 +44,6 @@ const ACTION_NAMES = {
   playlist_delete: "删除歌单",
   reorder_tracks: "重排歌曲",
   track_delete: "删除歌曲",
-  confirm_restore: "确认恢复",
 };
 
 function actionLabel(j) {
