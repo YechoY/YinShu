@@ -119,9 +119,14 @@ class SpaceRuntime:
                 return legacy   # 老空间：沿用升级前的 client，零行为变化
         if cid not in self.engine.clients:
             caps = adapters.CAPABILITIES.get(dialect, {})
+            _d = adapters.REGISTRY.get(dialect)
+            _srcs = caps.get("round_trip_sources")
             self.engine.register_client(
                 cid, dialect=dialect, identity_verified=True,
-                can_delete=bool(caps.get("delete_track", False)))
+                can_delete=bool(caps.get("delete_track", False)),
+                deliver_ack_on_view=_d.deliver_ack_on_view if _d is not None else True,
+                full_view_submit=bool(caps.get("full_view_submit", False)),
+                round_trip_sources=frozenset(_srcs) if _srcs else None)
             self._clients[cid] = dialect
         return cid
 
@@ -159,7 +164,16 @@ class Hub:
         self.store_dir = store_dir
         os.makedirs(store_dir, exist_ok=True)
         self._runtimes: Dict[str, SpaceRuntime] = {}
+        # 由 api 层注入：每次加载/探测到空间后立刻套用全局 policy
+        # （第八轮修正：_apply_engine_policy 原先只在启动时对**已加载**的空间生效，
+        #  按需加载的空间永远拿不到 policy —— 开关缺省的旧 pkl 因此一直产生恢复卡）
+        self.policy_hook = None
         self._load_index()
+
+    def _apply_policy(self, rt: Optional[SpaceRuntime]) -> None:
+        hook = getattr(self, "policy_hook", None)
+        if hook is not None and rt is not None and rt.engine is not None:
+            hook(rt.engine)
 
     def _space_path(self, space_id: str) -> str:
         return os.path.join(self.store_dir, f"space__{space_id}.pkl")
@@ -193,6 +207,7 @@ class Hub:
                 rt = SpaceRuntime(space_id)
                 self._known.add(space_id)
             self._runtimes[space_id] = rt
+        self._apply_policy(rt)
         return rt
 
     def probe(self, space_id: str) -> Optional[SpaceRuntime]:
@@ -201,6 +216,7 @@ class Hub:
         rt = self._runtimes.get(space_id)
         if rt is None:
             rt = self._load(space_id)
+        self._apply_policy(rt)
         return rt
 
     def list_spaces(self) -> list[str]:
@@ -220,7 +236,11 @@ class Hub:
         """P0-4：原子落盘（tmp + fsync + os.replace）+ 滚动 .bak。"""
         rt = self._runtimes.get(space_id)
         if rt is None:
-            return
+            # 2026-10-08：这里原先静默 return —— 维护脚本用 probe()（只读、不登记
+            # _runtimes）拿到空间再调 save()，会"看起来落盘成功但一个字节都没写"。
+            # 改为显式报错，杜绝静默丢写。（api 层调用点全部先 Hub.get()。）
+            raise KeyError("空间 %s 未加载到内存，save() 不会写盘；请先用 Hub.get(space_id) 取运行时"
+                           % space_id)
         import pickle
         blob = {
             "schema_version": SCHEMA_VERSION,
@@ -335,8 +355,18 @@ def _repair_engine_fields(engine) -> None:
     if not hasattr(engine, "sort_tag"):
         engine.sort_tag = 0
     # 第四轮引擎策略（P0-C/P1-1/P1-2）：旧 pkl 补默认值
-    if not hasattr(engine, "confirm_restore"):
-        engine.confirm_restore = False
+    # 第八轮修正：开关原名 confirm_restore，与同名方法 SyncSpace.confirm_restore(key)
+    # 撞名——旧 pkl 里缺这个实例属性时 hasattr() 摸到的是方法（恒为真）⇒ 默认值永远补不上，
+    # `_note_restore` 又会把绑定方法当真值 ⇒ 恢复卡照旧产生；而一旦实例里真的写入 bool，
+    # 又会遮住方法，使确认恢复接口 `eng.confirm_restore(key)` 报 'bool' object is not callable。
+    # 故：清掉遗留的同名 bool，改用新名 restore_cards_enabled。
+    if isinstance(engine.__dict__.get("confirm_restore"), bool):
+        engine.__dict__.pop("confirm_restore", None)
+    if not hasattr(engine, "restore_cards_enabled"):
+        engine.restore_cards_enabled = False
+    # 第八轮：批量删除也不再有"待确认删除"卡（用户 2026-10-08「不要再弹确认了」）
+    if not hasattr(engine, "delete_cards_enabled"):
+        engine.delete_cards_enabled = False
     if not hasattr(engine, "trusted_direct_delete"):
         engine.trusted_direct_delete = True
     if not hasattr(engine, "restore_grace_seconds"):
@@ -346,6 +376,14 @@ def _repair_engine_fields(engine) -> None:
             c.last_delivered_stamp = None
         if not hasattr(c, "last_submitted_stamp"):
             c.last_submitted_stamp = None
+        # 第十一轮 R1 放松：旧 pkl 的客户端对象没有这两个字段——按方言能力表补。
+        # 必须查实例 __dict__（不能 hasattr）：dataclass 的类级默认值会让 hasattr 恒为真，
+        # 补不上就会一路用 False/None（与上面 confirm_restore 踩的是同一类坑）。
+        if "full_view_submit" not in c.__dict__ or "round_trip_sources" not in c.__dict__:
+            caps = adapters.CAPABILITIES.get(c.dialect, {})
+            c.full_view_submit = bool(caps.get("full_view_submit", False))
+            _srcs = caps.get("round_trip_sources")
+            c.round_trip_sources = frozenset(_srcs) if _srcs else None
         if c.base_served is not None:
             if not hasattr(c.base_served, "stamp"):
                 c.base_served.stamp = ""

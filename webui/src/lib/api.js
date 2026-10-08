@@ -338,12 +338,6 @@ export async function rejectPendingRestore(token, key) {
 }
 
 /* ---- 格式化 ---- */
-/* 空间显示名（第三轮 §2）：展示 name，回退 id；孤儿/未知 → 原样 */
-export function spaceLabel(s) {
-  if (!s) return "";
-  return (s && s.name) ? s.name : (typeof s === "string" ? s : (s.space || ""));
-}
-
 export function pad(n) { return String(n).padStart(2, "0"); }
 
 export function fmtTime(iso) {

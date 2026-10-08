@@ -63,6 +63,7 @@ class TestFaultInjection(unittest.TestCase):
     # （第四轮 P1-2：trusted_direct_delete=False 时恢复旧安全阀行为；可信客户端默认直删）
     def test_safety_valve_defers_add_and_delete(self):
         self.sp.trusted_direct_delete = False
+        self.sp.delete_cards_enabled = True    # 第八轮默认 False（永不挂卡）；显式测旧通道
         self.sp.merge("A", sub(pl("p1", "歌单", *[("tx", f"t{i}") for i in range(12)])))
         self.sp.deliver("A")
         # 同时删 11 首（触发）并新增 z → 新增照常应用，删除挂起
@@ -79,6 +80,7 @@ class TestFaultInjection(unittest.TestCase):
     # 安全阀：用户放弃（reject）→ 条目保留，不写墓碑（不可信端点）
     def test_safety_valve_reject_keeps(self):
         self.sp.trusted_direct_delete = False
+        self.sp.delete_cards_enabled = True
         self.sp.merge("A", sub(pl("p1", "歌单", *[("tx", f"t{i}") for i in range(12)])))
         self.sp.deliver("A")
         self.sp.merge("A", sub(pl("p1", "歌单", ("tx", "t0"))))

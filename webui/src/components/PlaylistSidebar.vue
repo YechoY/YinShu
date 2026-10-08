@@ -11,8 +11,7 @@ const props = defineProps({
 const emit = defineEmits(["select", "refresh"]);
 
 const busy = ref(false);
-const dialog = ref("");        // "" | del | err
-const delTarget = ref(null);
+const dialog = ref("");        // "" | err（删除不再二次确认：用户 2026-10-08「不要再弹确认了」）
 const err = ref("");
 const NOTE_SVG = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="19" height="19"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>`;
 
@@ -42,25 +41,16 @@ async function move(idx, target) {
   }
 }
 
-/* 删除歌单：先弹自定义确认框（不用浏览器原生 confirm） */
-function askRemove(p) {
+/* 删除歌单：直接生效（用户 2026-10-08「不要再弹确认了」；枢纽删除即时生效） */
+async function askRemove(p) {
   if (busy.value) return;
-  delTarget.value = p;
-  err.value = "";
-  dialog.value = "del";
-}
-
-async function confirmDelete() {
-  const p = delTarget.value;
-  if (!p || busy.value) return;
   busy.value = true;
   try {
     await deletePlaylist(props.token, p.pl_id);
-    closeDialog();
-    delTarget.value = null;
     emit("refresh");
   } catch (e) {
     err.value = "删除失败：" + e.message;
+    dialog.value = "err";
   } finally {
     busy.value = false;
   }
@@ -103,26 +93,8 @@ async function confirmDelete() {
     </div>
   </aside>
 
-  <!-- 删除歌单确认（自定义 dialog，Teleport 到 body 保证全局居中） -->
+  <!-- 删除歌单不再二次确认（用户 2026-10-08「不要再弹确认了」） -->
   <Teleport to="body">
-    <div v-if="dialog === 'del'" class="modal-mask" @click.self="closeDialog">
-      <div class="modal glass">
-        <div class="modal-head">
-          <strong>删除歌单</strong>
-          <button class="modal-x" title="关闭" @click="closeDialog">×</button>
-        </div>
-        <div v-if="err" class="modal-msg err">{{ err }}</div>
-        <div class="modal-body">
-          确定删除歌单「<strong>{{ delTarget?.name }}</strong>」？
-          删除会同步到所有客户端（澜音 / 栖弦），<strong>不可恢复</strong>。
-        </div>
-        <div class="form-ops">
-          <button class="btn-primary danger-solid" :disabled="busy" @click="confirmDelete">{{ busy ? "删除中…" : "确定" }}</button>
-          <button class="btn-ghost form-btn" :disabled="busy" @click="closeDialog">取消</button>
-        </div>
-      </div>
-    </div>
-
     <!-- 操作失败提示 -->
     <div v-if="dialog === 'err'" class="modal-mask" @click.self="closeDialog">
       <div class="modal glass">

@@ -247,7 +247,10 @@ function roleLabel(r) { return ROLE_LABEL[r] || r || ""; }
           @refresh="fetchState(true)"
         />
         <div class="main-col">
+          <!-- 用户 2026-10-08「不要再弹确认了」：默认不再渲染待确认卡；
+               仅当服务端 policy 显式打开 confirm_restore/confirm_delete 时显示 -->
           <PendingCard
+            v-if="state?.policy?.confirm_restore || state?.policy?.confirm_delete"
             :token="token"
             :deletions="state?.pendingDeletions || []"
             :restores="state?.pendingRestores || []"

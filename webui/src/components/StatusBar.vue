@@ -26,6 +26,7 @@ watch(
 const DEVICE_NAMES = {
   "ceru-plugin": "澜音插件",
   "cyshine-v1": "栖弦",
+  "lx-x": "洛雪",
 };
 
 function clientParts(c) {

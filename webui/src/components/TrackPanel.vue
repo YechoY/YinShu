@@ -12,8 +12,7 @@ const emit = defineEmits(["refresh"]);
 
 const search = ref("");
 const busy = ref(false);
-const dialog = ref("");        // "" | del | err
-const delTarget = ref(null);
+const dialog = ref("");        // "" | err（删除不再二次确认：用户 2026-10-08「不要再弹确认了」）
 const err = ref("");
 const NOTE_SVG = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="28" height="28"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>`;
 const NOTE_SVG_SM = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="15" height="15"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>`;
@@ -63,25 +62,18 @@ async function moveTrack(fIdx, delta) {
   }
 }
 
-/* 删除歌曲：先弹自定义确认框（不用浏览器原生 confirm） */
-function askRemove(t) {
-  if (busy.value || !props.playlist) return;
-  delTarget.value = t;
-  err.value = "";
-  dialog.value = "del";
-}
-
-async function confirmDelete() {
-  const t = delTarget.value;
-  if (!t || busy.value || !props.playlist) return;
+/* 删除歌曲：直接生效。枢纽的删除是"下次交付即消失"，且曲目池仍保留元数据，
+   再导入/别处还在时会自动回到视图 —— 不需要二次确认。 */
+async function askRemove(t) {
+  const p = props.playlist;
+  if (busy.value || !p) return;
   busy.value = true;
   try {
-    await deleteTrack(props.token, props.playlist.pl_id, t.key);
-    closeDialog();
-    delTarget.value = null;
+    await deleteTrack(props.token, p.pl_id, t.key);
     emit("refresh");
   } catch (e) {
     err.value = "删除失败：" + e.message;
+    dialog.value = "err";
   } finally {
     busy.value = false;
   }
@@ -164,27 +156,10 @@ async function confirmDelete() {
       </div>
     </div>
 
-    <!-- 删除歌曲确认（自定义 dialog，Teleport 到 body 保证全局居中；替代浏览器原生 confirm） -->
-    <Teleport to="body">
-    <div v-if="dialog === 'del'" class="modal-mask" @click.self="closeDialog">
-      <div class="modal glass">
-        <div class="modal-head">
-          <strong>删除歌曲</strong>
-          <button class="modal-x" title="关闭" @click="closeDialog">×</button>
-        </div>
-        <div v-if="err" class="modal-msg err">{{ err }}</div>
-        <div class="modal-body">
-          确定删除歌曲「<strong>{{ delTarget?.title || delTarget?.key }}</strong>」？
-          会从所有歌单删除并同步到澜音 / 栖弦，<strong>不可恢复</strong>。
-        </div>
-        <div class="form-ops">
-          <button class="btn-primary danger-solid" :disabled="busy" @click="confirmDelete">{{ busy ? "删除中…" : "确定" }}</button>
-          <button class="btn-ghost form-btn" :disabled="busy" @click="closeDialog">取消</button>
-        </div>
-      </div>
-    </div>
+    <!-- 删除不再二次确认（用户 2026-10-08「不要再弹确认了」） -->
 
     <!-- 操作失败提示 -->
+    <Teleport to="body">
     <div v-if="dialog === 'err'" class="modal-mask" @click.self="closeDialog">
       <div class="modal glass">
         <div class="modal-head">

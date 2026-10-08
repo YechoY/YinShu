@@ -157,6 +157,21 @@ class TestMergeEngine(unittest.TestCase):
         self.assertIn("歌单甲", {e["name"] for e in self.sp.clients["C"].base_served.view.values()})
         self.assertEqual(live_track_keys(self.sp, pl_id_of(self.sp, "歌单甲")), {"tx:x"})
 
+    # 用例 8b（第八轮补）：首次接入里"新增的曲目"也必须置顶（与正常 merge 同一规则）。
+    # 真机现象（m03744）：栖弦首次提交把新加的歌追加到了歌单最底部。
+    def test_08b_first_adoption_new_tracks_to_head(self):
+        self.sp.merge("A", sub(pl("p1", "歌单", ("tx", "o1"), ("tx", "o2"), ("tx", "o3"))))
+        self.sp.deliver("A")
+        self.sp.register_client("C", dialect="cyshine-v1", identity_verified=True)
+        rc = self.sp.merge("C", sub(pl("p1", "歌单", ("tx", "n1"), ("tx", "n2"),
+                                      ("tx", "o1"), ("tx", "o2"), ("tx", "o3"))))
+        self.assertTrue(rc.meta.get("adopted"))
+        pid = pl_id_of(self.sp, "歌单")
+        order = [self.sp.tracks[t].key for t in self.sp.playlists[pid].track_ids
+                 if self.sp.tracks[t].deleted_at is None]
+        # 新增置顶（按提交顺序），老歌相对顺序不变
+        self.assertEqual(order, ["tx:n1", "tx:n2", "tx:o1", "tx:o2", "tx:o3"])
+
     # 用例 9：客户端清数据重装 → 只增不删；已删的风控提示但不血洗
     def test_09_reinstall_no_wipe(self):
         self.sp.merge("A", sub(pl("p1", "歌单", ("tx", "x"), ("wy", "y"))))
@@ -224,6 +239,7 @@ class TestMergeEngine(unittest.TestCase):
     # （第四轮 P1-2：trusted_direct_delete=False 时恢复旧安全阀行为；可信客户端默认直删，见 test_14b）
     def test_14_safety_valve_80_percent(self):
         self.sp.trusted_direct_delete = False
+        self.sp.delete_cards_enabled = True    # 第八轮默认 False（永不挂卡）；这里显式测旧安全阀通道
         tracks = [("tx", f"t{i}") for i in range(12)]
         self.sp.merge("A", sub(pl("p1", "歌单", *tracks)))
         self.sp.deliver("A")
@@ -255,6 +271,7 @@ class TestMergeEngine(unittest.TestCase):
     # （不可信端点/开关关闭时，批量删除仍挂起待确认，与 test_14 行为一致）
     def test_trusted_direct_delete_off_restores_old_valve(self):
         self.sp.trusted_direct_delete = False
+        self.sp.delete_cards_enabled = True
         tracks = [("tx", f"t{i}") for i in range(12)]
         self.sp.merge("A", sub(pl("p1", "歌单", *tracks)))
         self.sp.deliver("A")
@@ -331,17 +348,21 @@ class TestMergeEngine(unittest.TestCase):
         self.assertEqual(live_track_keys(self.sp, pl_id_of(self.sp, "歌单")), {"tx:x", "wy:y"})
         self.assertFalse(self.sp.pending_deletions)
 
-    # 用例 20：三客户端交错 GET/PUT。第四轮"同空间成员互信"：
-    # A GET 对齐最新后回写自己的旧段（本地 LWW 保留 p1）→ p2/p3 ∉ owned(A)
-    # ⇒ 缺席即删（互信直删，写墓碑）；B/C 看过删除视图后回推 ⇒ 直接恢复（无卡）。
+    # 用例 20：三客户端交错 GET/PUT。第七轮：删除只认"自己提交过"（owned）的缺席——
+    # A 先整段提交 p1+p2+p3（进入 owned 水位），再回写只剩 p1 的旧段 → p2/p3 缺席即删
+    # （写墓碑）；B/C 看过删除视图后回推 ⇒ 直接恢复（无卡）。
     def test_20_three_client_interleave(self):
         self.sp.register_client("C", dialect="cyshine-v1", identity_verified=True)
         self.sp.merge("A", sub(pl("p1", "歌单甲", ("tx", "x"))))
         self.sp.deliver("A")                       # rev1
         self.sp.merge("B", sub(pl("p2", "歌单乙", ("wy", "y"))))  # B 写但未 GET
         self.sp.merge("C", sub(pl("p3", "歌单丙", ("kw", "k"))))  # C 首接
-        # A GET 对齐最新（含 p2/p3）后回写旧段
+        # A GET 对齐最新（含 p2/p3），随后整段提交 p1+p2+p3 → p2/p3 进入 A 的 owned 水位
         self.sp.deliver("A")
+        self.sp.merge("A", sub(pl("p1", "歌单甲", ("tx", "x")),
+                               pl("p2", "歌单乙", ("wy", "y")),
+                               pl("p3", "歌单丙", ("kw", "k"))))
+        # A 回写只剩 p1 的旧段 ⇒ p2/p3 ∉ 提交内容、∈ owned(A) ⇒ 判删
         ra = self.sp.merge("A", sub(pl("p1", "歌单甲", ("tx", "x"))))
         self.assertEqual(len(ra.meta["removed_playlists"]), 2)      # p2/p3 缺席即删
         yb = next(pl for pl in self.sp.playlists.values() if pl.name == "歌单乙")
@@ -475,15 +496,20 @@ class TestMergeEngine(unittest.TestCase):
         self.sp.deliver("B")
         self.assertEqual(self._served_order(self.sp, "B", "歌单"), ["kg:1", "tx:2", "wy:3"])
 
-    # 排序同步：已有歌单追加新歌，原顺序保持，新歌追加到末尾
-    def test_order_append_new_tracks_keeps_existing(self):
+    # 排序同步（第七轮，用户拍板）：已有歌单新增的歌放到**最顶部**，原顺序保持
+    def test_order_new_tracks_go_to_head(self):
         self.sp.merge("A", sub(pl("p1", "歌单", ("kg", "1"), ("tx", "2"))))
         self.sp.deliver("A")
         self.assertEqual(self._served_order(self.sp, "A", "歌单"), ["kg:1", "tx:2"])
         self.sp.merge("A", sub(pl("p1", "歌单", ("kg", "1"), ("tx", "2"), ("mg", "9"))))
         self.sp.deliver("A")
         self.assertEqual(self._served_order(self.sp, "A", "歌单"),
-                         ["kg:1", "tx:2", "mg:9"], "新歌追加末尾，原顺序不变")
+                         ["mg:9", "kg:1", "tx:2"], "新增歌置顶，原相对顺序不变")
+        # 对端 B 也应看到同样的置顶顺序
+        self.sp.merge("B", sub(pl("p1", "歌单", ("kg", "1"), ("tx", "2"), ("mg", "9"))))
+        self.sp.deliver("B")
+        self.assertEqual(self._served_order(self.sp, "B", "歌单"),
+                         ["mg:9", "kg:1", "tx:2"], "置顶顺序跨客户端一致")
 
     # 排序同步：已有歌单集合不变、顺序不同（纯重排）→ 应用提交顺序并传播
     def test_order_reorder_propagates(self):

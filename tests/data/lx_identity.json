@@ -1,0 +1,72 @@
+{
+  "version": "2",
+  "lastModified": 1790838848951,
+  "data": {
+    "userList": [
+      {
+        "id": "userlist_identity01",
+        "name": "身份样例",
+        "locationUpdateTime": null,
+        "list": [
+          {
+            "id": "545879713_E3426FF0609426305A4A4BB9DC2AD29B",
+            "name": "燕无歇 (鼓点氛围版)",
+            "singer": "小阿七",
+            "source": "kg",
+            "interval": "03:27",
+            "meta": {
+              "id": 0,
+              "hash": "E3426FF0609426305A4A4BB9DC2AD29B",
+              "albumName": "翻唱",
+              "picUrl": "http://x/pic1.jpg"
+            }
+          },
+          {
+            "name": "无顶层id退songmid",
+            "singer": "某人",
+            "source": "wy",
+            "interval": "04:10",
+            "meta": {"songmid": "ABC123"}
+          },
+          {
+            "id": "local_1",
+            "name": "本地文件",
+            "source": "local",
+            "interval": "02:00",
+            "meta": {}
+          },
+          {
+            "id": "nonlist_1",
+            "name": "未知格式",
+            "source": "xx",
+            "interval": "03:00",
+            "meta": {}
+          },
+          {
+            "id": "",
+            "name": "无id无meta",
+            "singer": "谁",
+            "source": "kw",
+            "interval": "01:00",
+            "meta": {}
+          },
+          {
+            "id": "tx_abcdef1234567890",
+            "name": "标准tx",
+            "singer": "A",
+            "source": "tx",
+            "interval": "03:33",
+            "meta": {
+              "id": 888,
+              "songId": "abcdef1234567890",
+              "strMediaMid": "mid1",
+              "albumName": "专辑",
+              "picUrl": "http://x/p.jpg",
+              "qualitys": [{"type": "128k"}, {"type": "flac"}]
+            }
+          }
+        ]
+      }
+    ]
+  }
+}

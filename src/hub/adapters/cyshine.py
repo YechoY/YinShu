@@ -1,52 +1,13 @@
-"""方言适配器（docs/04 §4.3/4.4）：把客户端原生格式 ↔ 引擎 submission/view 互译。
+"""cyshine-v1（栖弦）方言适配器 —— 原 src/hub/adapters.py 原样搬移（第六轮 §1.2）。
 
-适配器是纯函数，不含合并逻辑——合并只发生在引擎（docs/05）。任何 lossy 行为须在此登记。
-
-本文件按设计文档描述的格式实现（docs/02 §2.2.1 + docs/04 §4.4.1 + spec/canonical-v1 §12 渲染硬要求）；
-真实栖弦 237KB 全字段的精确对齐留待 M0.5 真机取证（样本/源码当前不在项目目录）。
+函数体与旧文件逐字节一致，仅新增模块级 DIALECT 注册表条目与 RenderContext 薄包装。
 """
 from __future__ import annotations
 
-import re
 from typing import Dict, List, Optional, Tuple
 
-# 身份键分隔符
-KEY_SEP = ":"
+from .base import KEY_SEP, ParseError, RenderContext, Dialect, _duration_ms_to_interval, _interval_to_duration_ms, identity_key
 
-
-class ParseError(Exception):
-    """客户端负载结构损坏 / 无法表达，应返回 400 且不动基线。"""
-
-
-# ---------------------------------------------------------------------------
-# 通用小工具
-# ---------------------------------------------------------------------------
-
-def _interval_to_duration_ms(interval) -> Optional[int]:
-    """'03:27' → 207000。非法/缺失 → None。"""
-    if not isinstance(interval, str):
-        return None
-    m = re.fullmatch(r"(\d+):(\d{2})", interval.strip())
-    if not m:
-        return None
-    return (int(m.group(1)) * 60 + int(m.group(2))) * 1000
-
-
-def _duration_ms_to_interval(duration_ms) -> str:
-    """207000 → '03:27'（零填充，canonical-v1 §12 硬要求 4）。"""
-    if duration_ms is None:
-        return "0:00"
-    total_s = max(0, int(duration_ms) // 1000)
-    return f"{total_s // 60:02d}:{total_s % 60:02d}"
-
-
-def identity_key(source: str, song_id: str) -> str:
-    return f"{source}{KEY_SEP}{song_id}"
-
-
-# ---------------------------------------------------------------------------
-# cyshine-v1（栖弦）—— parse / render
-# ---------------------------------------------------------------------------
 
 # 栖弦顶层结构（docs/02 §2.2.1）：
 #   { "schemaVersion":1, "sections":{ "playlists":{ "data":[ {version,id,name,tracks,createdAt,updatedAt} ]},
@@ -114,6 +75,11 @@ def parse_cyshine(payload: dict) -> Tuple[dict, Dict[str, dict], dict, List[str]
         "tracks": opaque_tracks or None,
     }
     submission = {"playlists": playlists, "opaque": opaque, "create_only": False}
+    # P0-A：客户端声明的时刻由适配器交给引擎（api.py 只读 submission.client_modified_at，
+    # 不认任何方言字段名——加客户端不改枢纽）。
+    modified_at = pl_section.get("modifiedAt")
+    if isinstance(modified_at, str) and modified_at:
+        submission["client_modified_at"] = modified_at
     return submission, meta_delta, opaque, warnings
 
 
@@ -226,102 +192,25 @@ def _render_cyshine_track(key: str, meta_pool: Dict[str, dict]) -> dict:
     }
 
 
-# ---------------------------------------------------------------------------
-# ceru-plugin（澜音插件）—— parse / render
-#
-# 澜音插件 SDK 缺"删歌/删歌单/建歌单"，capabilities().deleteTrack = false
-# （docs/02 §2.2.2、docs/04 §4.4.3）。因此：
-#   - parse：接受其提交的简单列表格式；
-#   - render：把"本地应删的歌"放进待清理清单（不静默丢弃，A5）。
-# ---------------------------------------------------------------------------
-
-def parse_ceru(payload: dict) -> Tuple[dict, Dict[str, dict], dict, List[str]]:
-    """澜音插件提交 → (submission, 元数据增量, opaque, warnings)。
-
-    线格式：{ "playlists": [ { "id", "name", "tracks": [ {"source","songId","title","singer","album","durationMs"} ] } ] }
-    """
-    warnings: List[str] = []
-    if not isinstance(payload, dict):
-        raise ParseError("payload 必须是对象")
-    raw = payload.get("playlists")
-    if not isinstance(raw, list):
-        raise ParseError("playlists 必须是数组")
-    playlists, meta_delta = [], {}
-    for item in raw:
-        if not isinstance(item, dict):
-            raise ParseError("playlist 元素必须是对象")
-        pl_id = item.get("id") or item.get("native_id")
-        name = item.get("name") or ""
-        if not isinstance(pl_id, str) or not pl_id:
-            raise ParseError(f"歌单缺 id: {item!r}")
-        raw_tracks = item.get("tracks") or []
-        tracks, meta = _ceru_tracks(raw_tracks)
-        playlists.append({"native_id": pl_id, "name": name, "tracks": tracks})
-        for k, v in meta.items():
-            meta_delta.setdefault(k, {}).update({kk: vv for kk, vv in v.items() if vv is not None})
-    submission = {"playlists": playlists, "opaque": None, "create_only": False}
-    return submission, meta_delta, {"appearance": None, "musicSources": None}, warnings
+def _render(ctx: RenderContext) -> dict:
+    """RenderContext 薄包装 → render_cyshine（第 4 参 opaque、另带 revision/pl_times/opaque_tracks）。"""
+    return render_cyshine(ctx.view, ctx.meta_pool, ctx.native_ids, ctx.opaque,
+                          ctx.revision, ctx.generated_at, pl_times=ctx.playlist_times,
+                          opaque_tracks=ctx.opaque_tracks)
 
 
-def _ceru_tracks(raw_tracks) -> Tuple[List[dict], Dict[str, dict]]:
-    tracks, meta = [], {}
-    for tr in raw_tracks:
-        if not isinstance(tr, dict):
-            raise ParseError("track 必须是对象")
-        src = tr.get("source"); sid = tr.get("songId")
-        if not isinstance(src, str) or not src or not isinstance(sid, str) or not sid:
-            raise ParseError(f"曲目缺 source/songId: {tr!r}")
-        key = identity_key(src, sid)
-        tracks.append({"source": src, "songId": sid})
-        meta[key] = {
-            "source": src,
-            "title": tr.get("title"),
-            "singer": tr.get("singer"),
-            "album": tr.get("album"),
-            "duration_ms": tr.get("durationMs"),
-            "quality": tr.get("quality"),
-            "pic_url": tr.get("picUrl"),
-        }
-    return tracks, meta
-
-
-def render_ceru(view: Dict[str, dict], meta_pool: Dict[str, dict],
-                native_ids: Dict[str, str], cleanup: List[dict],
-                generated_at: str) -> dict:
-    """引擎 view → 澜音格式 + 待清理清单（deleteTrack=false，A5）。"""
-    playlists = []
-    for pl_id, info in view.items():
-        plid = native_ids.get(pl_id, pl_id)
-        tracks = []
-        for k in info["tracks"]:   # 保留歌单内顺序
-            src, sid = k.split(KEY_SEP, 1)
-            meta = meta_pool.get(k, {})
-            tracks.append({
-                "source": src, "songId": sid,
-                "title": meta.get("title") or sid,
-                "singer": meta.get("singer") or "",
-                "album": meta.get("album") or "",
-                "durationMs": meta.get("duration_ms"),
-                "quality": meta.get("quality") or "",
-                "picUrl": meta.get("pic_url") or "",
-            })
-        playlists.append({"id": plid, "name": info["name"], "tracks": tracks})
-    return {
-        "schemaVersion": 1,
-        "generatedAt": generated_at,
-        "playlists": playlists,
-        "cleanup": cleanup,   # 本地应删但该端无删歌能力 → 待清理清单（A5）
-    }
-
-
-# 方言能力表（docs/04 §4.3 capabilities()）
-CAPABILITIES = {
-    "cyshine-v1": {"delete_track": True, "delete_playlist": True,
-                   "create_playlist": True, "reorder": False},
-    # 2026-10-07 用户拍板：澜音按"能删"处理——插件自身删不掉本地副本是**客户端**要解决的
-    # 问题（其开发者正在处理；用户手动删掉即可），枢纽不再为它走"缺席不判删"的特殊路径。
-    # 影响：澜音提交里"少了"的曲目按删除处理；交付即 ack 后若又回推，由 merge 的 carried
-    # 撤销确认（engine.py 的 t.acked.discard），不会让墓碑被错误 GC。
-    "ceru-plugin": {"delete_track": True, "delete_playlist": True,
-                    "create_playlist": False, "reorder": False},
-}
+DIALECT = Dialect(
+    name="cyshine-v1",
+    roots=("CyShineMusic",),
+    files=("sync-v1.json",),
+    parse=parse_cyshine,
+    render=_render,
+    capabilities={
+        "delete_track": True,
+        "delete_playlist": True,
+        "create_playlist": True,
+        "reorder": False,
+    },
+    empty_view_on_no_baseline=False,
+    file_fallback=False,
+)

@@ -1,9 +1,8 @@
 """FastAPI 版同步服务 + AList 式可视化界面（playlist-sync-hub 合并枢纽）。
 
 保留原 server.py 的同步端点与语义（客户端零改动）：
-  GET/PUT /CyShineMusic/sync-v1.json   → 栖弦（cyshine-v1）
-  GET/PUT /ceru/sync-v1.json           → 澜音插件（ceru-plugin）
-  MKCOL /CyShineMusic（目录路径）       → 201 幂等（栖弦启动探测）
+  GET/PUT /<方言根>/<文件名>  → 按 REGISTRY 循环注册（栖弦 / 澜音插件 / 洛雪）
+  MKCOL /<方言根>（目录路径） → 201 幂等（客户端启动探测）
 新增可视化：
   GET /                  → AList 式 Web UI（登录页）
   GET /api/state         → 歌单/歌曲/客户端/同步日志（只读渲染，不推进交付基线）
@@ -28,29 +27,24 @@ from fastapi.responses import HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 from . import adapters
+from .adapters import REGISTRY, RenderContext
 from .store import Hub
 
 # 项目根（src/hub/api.py → 上溯三级）与前端目录
 _ROOT = Path(__file__).resolve().parents[2]
 _WEBUI = _ROOT / "webui"
 
-# 路径 → 方言
-_ROUTES = {
-    "/CyShineMusic/sync-v1.json": "cyshine-v1",
-    "/ceru/sync-v1.json": "ceru-plugin",
-}
-_PARSE = {
-    "cyshine-v1": adapters.parse_cyshine,
-    "ceru-plugin": adapters.parse_ceru,
-}
-_RENDER = {
-    "cyshine-v1": adapters.render_cyshine,
-    "ceru-plugin": adapters.render_ceru,
-}
+# 路径 → 方言（第六轮 §1：单一来源 = 适配器包 REGISTRY，按 Dialect.roots/files 循环注册）
+# _ROUTES/_PARSE/_RENDER 三表已删除；路由注册见文件尾部 _register_dialect_routes()。
 
 app = FastAPI(title="playlist-sync-hub", docs_url=None, redoc_url=None, openapi_url=None)
 # Vue 工程化构建产物（webui/dist/assets）
-app.mount("/assets", StaticFiles(directory=str(_WEBUI / "dist" / "assets")), name="assets")
+# 注意：dist/ 是构建产物、被 .gitignore 忽略，全新克隆或未构建的部署里可能不存在。
+# StaticFiles(check_dir=True) 在 import 期就会抛 RuntimeError，那样连 "/" 上的友好提示
+# （webui/dist/index.html 缺失，请先 npm run build）都到不了，所以先探测再挂载。
+_ASSETS_DIR = _WEBUI / "dist" / "assets"
+if _ASSETS_DIR.is_dir():
+    app.mount("/assets", StaticFiles(directory=str(_ASSETS_DIR)), name="assets")
 
 _hub: Optional[Hub] = None
 # 账号模型（v3）：name -> {password: 哈希, space(当前生效空间), role: "admin"|"user", enabled, created_at, updated_at}
@@ -77,6 +71,14 @@ DEFAULT_POLICY = {
     # 第四轮引擎策略（删除免二次确认，dsh §2.4）：
     "trusted_direct_delete": True,    # P1-2：可信同空间客户端批量删除直接生效，不挂确认卡
     "confirm_restore": False,         # P1-1：默认不产生"待确认恢复"卡（抑制由 meta 承载）
+    # 第八轮（2026-10-08 用户拍板「不要再弹确认了」）：批量删除的安全阀**默认不挂起**。
+    # False 时的两条分支（都写进 meta["safety_valve"]）：
+    #   可信端（identity_verified ∧ can_delete ∧ ¬retired，见 trusted_direct_delete）
+    #     → applied：直接生效、journal/meta 留痕；
+    #   不可信端 → withheld：**既不生效也不出卡**（它表达不了"我要批量删"的意图）。
+    # True 才回到"超阈值挂起 → 产生待确认删除卡（deferred）"的旧行为。
+    # 前端 PendingCard 也按此开关渲染。
+    "confirm_delete": False,
     "restore_grace_seconds": 120,     # P0-C：删除冷静期秒数（期内重加一律按残留压制）
 }
 _SPACE_ROLES = ("owner", "editor", "viewer")
@@ -130,21 +132,37 @@ def configure(hub: Hub, users: Dict[str, dict],
     _invites = dict(invites or {})
     _policy = dict(DEFAULT_POLICY)
     _policy.update(policy or {})
+    # 第八轮：让 Hub 在每次按需加载/探测空间后立刻套用 policy（否则后加载的空间
+    # 拿不到全局 policy，旧 pkl 的恢复卡开关会一直是缺省/方法真值）
+    if _hub is not None:
+        _hub.policy_hook = _apply_engine_policy_to
     _ensure_v3()
     _apply_engine_policy()
 
 
+def _apply_engine_policy_to(eng) -> None:
+    """把全局 policy 里的引擎策略套到**单个**引擎上（第八轮）。"""
+    if eng is None:
+        return
+    # 第八轮：清掉与同名方法撞名的遗留开关（旧 pkl 可能把 bool 写在了 confirm_restore 上）
+    if isinstance(eng.__dict__.get("confirm_restore"), bool):
+        eng.__dict__.pop("confirm_restore", None)
+    eng.restore_cards_enabled = bool(_policy.get("confirm_restore", False))
+    eng.delete_cards_enabled = bool(_policy.get("confirm_delete", False))
+    eng.trusted_direct_delete = bool(_policy.get("trusted_direct_delete", True))
+    eng.restore_grace_seconds = _policy.get("restore_grace_seconds")
+
+
 def _apply_engine_policy() -> None:
     """把 policy 里的引擎策略（第四轮 §2.4）应用到已加载的所有空间引擎。
-    新加载的空间由 _repair_engine_fields 兜底默认值（confirm_restore=False、
-    trusted_direct_delete=True、restore_grace_seconds=None→类常量）。"""
+    新加载的空间由 _repair_engine_fields 兜底默认值（restore_cards_enabled=False、
+    trusted_direct_delete=True、restore_grace_seconds=None→类常量），并在 Hub.get/probe
+    时通过 policy_hook 立刻套用（第八轮：按需加载的空间也要吃到 policy，否则
+    缺省的旧 pkl 会一直产生"待确认恢复"卡）。"""
     if _hub is None:
         return
     for rt in _hub._runtimes.values():
-        eng = rt.engine
-        eng.confirm_restore = bool(_policy.get("confirm_restore", False))
-        eng.trusted_direct_delete = bool(_policy.get("trusted_direct_delete", True))
-        eng.restore_grace_seconds = _policy.get("restore_grace_seconds")
+        _apply_engine_policy_to(rt.engine)
 
 
 def _ensure_v3() -> bool:
@@ -938,7 +956,7 @@ async def api_policy_update(request: Request,
         return JSONResponse({"error": "body 必须是 JSON"}, status_code=400)
     allowed = {"member_invite": bool, "user_create_space": bool,
                "allow_self_register": bool, "trusted_direct_delete": bool,
-               "confirm_restore": bool}
+               "confirm_restore": bool, "confirm_delete": bool}
     changed = []
     for k, conv in allowed.items():
         if k in body:
@@ -990,6 +1008,8 @@ def api_me(authorization: str = Header(default="")) -> JSONResponse:
             "my_quota": _quota_of(user),          # None = 不限（admin）；否则数字
             "member_invite": bool(_policy.get("member_invite", False)),
             "allow_self_register": bool(_policy.get("allow_self_register", True)),
+            "confirm_restore": bool(_policy.get("confirm_restore", False)),
+            "confirm_delete": bool(_policy.get("confirm_delete", False)),
         },
     })
 
@@ -1574,8 +1594,9 @@ def api_state(authorization: str = Header(default="")) -> JSONResponse:
     rt = _hub.get(space)
     eng = rt.engine
 
-    # 只读渲染：用任一客户端身份渲染视图，但绝不推进 base_served（查看不改变删除判定）
-    cid = rt.client_for(user, "ceru-plugin")
+    # 只读渲染：用任一已注册方言身份渲染视图（canonical 视图与方言无关，
+    # 只读不推进 base_served——查看不改变删除判定）。不硬编码方言名（第六轮 §1 验收）。
+    cid = rt.client_for(user, next(iter(REGISTRY)))
     client = eng.clients.get(cid)
     view = {}
     if client is not None:
@@ -1697,6 +1718,8 @@ def api_state(authorization: str = Header(default="")) -> JSONResponse:
             "max_owned_spaces": _policy.get("max_owned_spaces", 3),
             "member_invite": bool(_policy.get("member_invite", False)),
             "allow_self_register": bool(_policy.get("allow_self_register", True)),
+            "confirm_restore": bool(_policy.get("confirm_restore", False)),
+            "confirm_delete": bool(_policy.get("confirm_delete", False)),
         },
         "audit": audit,
         "revision": eng.revision,
@@ -1786,7 +1809,7 @@ def _pending_restore_action(key: str, authorization: str, confirm: bool) -> JSON
     return JSONResponse({"ok": True})
 
 
-# ---- 同步端点（保持原语义） ----
+# ---- 同步端点（保持原语义；第六轮 §1.4 路由泛型化：按 REGISTRY 循环注册） ----
 _DEVICE_RE = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
 
 
@@ -1813,86 +1836,67 @@ def _resolve_device(device: str, x_hub_device: str):
         return None, JSONResponse({"error": str(exc)}, status_code=400)
 
 
-@app.get("/d/{device}/CyShineMusic/sync-v1.json")
-def get_cyshine_dev(device: str, authorization: str = Header(default=""),
-                    if_none_match: str = Header(default=""),
-                    x_hub_device: str = Header(default="")) -> Response:
-    dev, err = _resolve_device(device, x_hub_device)
-    if err is not None:
-        return err
-    return _sync_get("cyshine-v1", authorization, if_none_match, device=dev)
+def _make_get(dialect: str, file: str, has_device: bool):
+    """生成 GET 路由闭包（第六轮 §1.4）：有/无设备段两种签名；file 用于旁路分流。"""
+    if has_device:
+        def route(device: str, authorization: str = Header(default=""),
+                  if_none_match: str = Header(default=""),
+                  x_hub_device: str = Header(default="")) -> Response:
+            dev, err = _resolve_device(device, x_hub_device)
+            if err is not None:
+                return err
+            return _sync_get(dialect, authorization, if_none_match, device=dev, file=file)
+    else:
+        def route(authorization: str = Header(default=""),
+                  if_none_match: str = Header(default=""),
+                  x_hub_device: str = Header(default="")) -> Response:
+            dev, err = _resolve_device(None, x_hub_device)
+            if err is not None:
+                return err
+            return _sync_get(dialect, authorization, if_none_match, device=dev, file=file)
+    return route
 
 
-@app.get("/d/{device}/ceru/sync-v1.json")
-def get_ceru_dev(device: str, authorization: str = Header(default=""),
-                 if_none_match: str = Header(default=""),
-                 x_hub_device: str = Header(default="")) -> Response:
-    dev, err = _resolve_device(device, x_hub_device)
-    if err is not None:
-        return err
-    return _sync_get("ceru-plugin", authorization, if_none_match, device=dev)
+def _make_put(dialect: str, file: str, has_device: bool):
+    """生成 PUT 路由闭包（第六轮 §1.4）：有/无设备段两种签名；file 用于旁路分流。"""
+    if has_device:
+        async def route(device: str, request: Request,
+                        authorization: str = Header(default=""),
+                        x_hub_device: str = Header(default="")) -> Response:
+            dev, err = _resolve_device(device, x_hub_device)
+            if err is not None:
+                return err
+            return _sync_put(dialect, authorization, await request.body(), device=dev, file=file)
+    else:
+        async def route(request: Request, authorization: str = Header(default=""),
+                        x_hub_device: str = Header(default="")) -> Response:
+            dev, err = _resolve_device(None, x_hub_device)
+            if err is not None:
+                return err
+            return _sync_put(dialect, authorization, await request.body(), device=dev, file=file)
+    return route
 
 
-@app.put("/d/{device}/CyShineMusic/sync-v1.json")
-async def put_cyshine_dev(device: str, request: Request,
-                          authorization: str = Header(default=""),
-                          x_hub_device: str = Header(default="")) -> Response:
-    dev, err = _resolve_device(device, x_hub_device)
-    if err is not None:
-        return err
-    return _sync_put("cyshine-v1", authorization, await request.body(), device=dev)
+def _register_dialect_routes() -> None:
+    """按 REGISTRY 循环注册全部方言路由（第六轮 §1.4）：
+
+    每个方言 roots×files → 4 条路由：/root/file 与 /d/{device}/root/file 的 GET/PUT。
+    必须在本模块加载时执行，且先于尾部 catch-all（webdav_fallback）注册。
+    """
+    for _d in REGISTRY.values():
+        for _root in _d.roots:
+            for _f in _d.files:
+                app.add_api_route(f"/{_root}/{_f}", _make_get(_d.name, _f, False), methods=["GET"])
+                app.add_api_route(f"/{_root}/{_f}", _make_put(_d.name, _f, False), methods=["PUT"])
+                app.add_api_route(f"/d/{{device}}/{_root}/{_f}", _make_get(_d.name, _f, True), methods=["GET"])
+                app.add_api_route(f"/d/{{device}}/{_root}/{_f}", _make_put(_d.name, _f, True), methods=["PUT"])
 
 
-@app.put("/d/{device}/ceru/sync-v1.json")
-async def put_ceru_dev(device: str, request: Request,
-                       authorization: str = Header(default=""),
-                       x_hub_device: str = Header(default="")) -> Response:
-    dev, err = _resolve_device(device, x_hub_device)
-    if err is not None:
-        return err
-    return _sync_put("ceru-plugin", authorization, await request.body(), device=dev)
-
-
-@app.get("/CyShineMusic/sync-v1.json")
-def get_cyshine(authorization: str = Header(default=""),
-                if_none_match: str = Header(default=""),
-                x_hub_device: str = Header(default="")) -> Response:
-    dev, err = _resolve_device(None, x_hub_device)
-    if err is not None:
-        return err
-    return _sync_get("cyshine-v1", authorization, if_none_match, device=dev)
-
-
-@app.get("/ceru/sync-v1.json")
-def get_ceru(authorization: str = Header(default=""),
-             if_none_match: str = Header(default=""),
-             x_hub_device: str = Header(default="")) -> Response:
-    dev, err = _resolve_device(None, x_hub_device)
-    if err is not None:
-        return err
-    return _sync_get("ceru-plugin", authorization, if_none_match, device=dev)
-
-
-@app.put("/CyShineMusic/sync-v1.json")
-async def put_cyshine(request: Request, authorization: str = Header(default=""),
-                      x_hub_device: str = Header(default="")) -> Response:
-    dev, err = _resolve_device(None, x_hub_device)
-    if err is not None:
-        return err
-    return _sync_put("cyshine-v1", authorization, await request.body(), device=dev)
-
-
-@app.put("/ceru/sync-v1.json")
-async def put_ceru(request: Request, authorization: str = Header(default=""),
-                   x_hub_device: str = Header(default="")) -> Response:
-    dev, err = _resolve_device(None, x_hub_device)
-    if err is not None:
-        return err
-    return _sync_put("ceru-plugin", authorization, await request.body(), device=dev)
+_register_dialect_routes()
 
 
 def _sync_get(dialect: str, authorization: str, if_none_match: str = "",
-              device: Optional[str] = None) -> Response:
+              device: Optional[str] = None, file: Optional[str] = None) -> Response:
     t0 = time.time()
     user = _auth_user(authorization)
     if user is None:
@@ -1903,6 +1907,15 @@ def _sync_get(dialect: str, authorization: str, if_none_match: str = "",
     if deny is not None:
         return deny
     rt = _hub.get(space)
+    # 第六轮 §2.4：旁路文件（如洛雪 settings.json/user_apis.json）——整文件 opaque 原样归还
+    _by = REGISTRY.get(dialect)
+    if _by is not None and file is not None and file in _by.bypass_files:
+        cid = rt.client_for(user, dialect, device)
+        blob = ((rt.opaque_by_client.get(cid) or {}).get("lx_blobs") or {}).get(file)
+        if blob is None:
+            _log(f"GET /{dialect}/{file} 404 旁路文件不存在（客户端按'云端未找到'处理）")
+            return JSONResponse({"error": "not found"}, status_code=404)
+        return Response(content=blob, media_type="application/json; charset=utf-8")
     role = _role_in(user, space)
     # 能力表单一来源（adapters.CAPABILITIES）：2026-10-07 起澜音也按可删处理
     can_delete = bool(adapters.CAPABILITIES.get(dialect, {}).get("delete_track", False))
@@ -1921,20 +1934,23 @@ def _sync_get(dialect: str, authorization: str, if_none_match: str = "",
                 _hub.save(space)
                 return JSONResponse({"error": "deliver failed"}, status_code=500)
             _hub.save(space)
-
     # P0-1：无基线客户端（从未交付且从未提交）→ 404，栖弦走"远端不存在 ⇒ 以本地为准 ⇒ PUT"。
-    # 澜音例外（**按方言判断，与删除能力无关**）：它把"空远端"只当作"没有可导入内容"，
+    # 澜音例外（**按方言注册表字段判断，与删除能力无关**）：它把"空远端"只当作"没有可导入内容"，
     #   404 反而让它误报"同步服务里没有该歌单端点"（澜音保存配置时会先探测），
     #   故给它 200 + 空歌单视图。2026-10-07 起澜音已按可删处理，但这条探测兼容保留。
     # （viewer 只读分支 result=None，不走 404，直接给权威视图。）
     if result is not None and result.status == 404:
         dev = f" device={device or 'default'}" if device else ""
         client = rt.engine.clients.get(cid)
-        if client is not None and client.dialect == "ceru-plugin":
-            payload = adapters.render_ceru({}, rt.meta_pool, rt.native_ids(dialect),
-                                           None, rt.engine._now())
+        d = REGISTRY.get(dialect)
+        if client is not None and d is not None and d.empty_view_on_no_baseline:
+            payload = d.render(RenderContext(
+                view={}, meta_pool=rt.meta_pool, native_ids=rt.native_ids(dialect),
+                pending_cleanup=None, opaque={}, opaque_tracks=None,
+                revision=rt.engine.revision, generated_at=rt.engine._now(), playlist_times={},
+            ))
             data = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-            _log(f'GET /{dialect}{dev} 200 空视图（无基线；澜音探测兼容）')
+            _log(f'GET /{dialect}{dev} 200 空视图（无基线；{dialect} 探测兼容）')
             return Response(content=data, media_type="application/json; charset=utf-8")
         _log(f'GET /{dialect}{dev} 404 无基线（从未交付/从未提交，需先 PUT 建基线）')
         return JSONResponse({"error": "no baseline"}, status_code=404)
@@ -1948,25 +1964,26 @@ def _sync_get(dialect: str, authorization: str, if_none_match: str = "",
         pending_cleanup = peek_cleanup
         generated_at = peek_stamp
     native_ids = rt.native_ids(dialect)
-    # P0-2：确定性 generatedAt/modifiedAt —— 用引擎 stamp（内容不变则同字节同值），不用墙钟
-    if dialect == "ceru-plugin":
-        payload = adapters.render_ceru(view, rt.meta_pool, native_ids,
-                                       pending_cleanup, generated_at)
-    else:
-        # P0-2/P0-3：歌单 createdAt/updatedAt 用 canonical 时刻；本地/文件曲目按 I6 回填
-        pl_times = {
-            pl_id: {"created_at": pl.created_at, "updated_at": pl.updated_at}
-            for pl_id, pl in rt.engine.playlists.items()
-            if pl.deleted_at is None
-        }
-        # 多账户共用歌单 §1：opaque 按客户端取（本客户端桶；老格式回退 legacy 槽）。
-        # viewer 只读快照没有客户端桶，且绝不能看到别人的私有 opaque → 用空。
-        client_opaque = ({} if cid is None
-                         else (rt.opaque_by_client.get(cid) or getattr(rt, "opaque_legacy", {})))
-        opaque_tracks = (client_opaque or {}).get("tracks") if isinstance(client_opaque, dict) else None
-        payload = _RENDER[dialect](view, rt.meta_pool, native_ids,
-                                   client_opaque, rt.engine.revision, generated_at,
-                                   pl_times=pl_times, opaque_tracks=opaque_tracks)
+    # 渲染统一走注册表（第六轮 §1.3：RenderContext 抹平各方言渲染器签名差异）。
+    # P0-2：确定性 generatedAt/modifiedAt —— 用引擎 stamp（内容不变则同字节同值），不用墙钟；
+    # P0-2/P0-3：歌单 createdAt/updatedAt 用 canonical 时刻；本地/文件曲目按 I6 回填。
+    pl_times = {
+        pl_id: {"created_at": pl.created_at, "updated_at": pl.updated_at}
+        for pl_id, pl in rt.engine.playlists.items()
+        if pl.deleted_at is None
+    }
+    # 多账户共用歌单 §1：opaque 按客户端取（本客户端桶；老格式回退 legacy 槽）。
+    # viewer 只读快照没有客户端桶，且绝不能看到别人的私有 opaque → 用空。
+    client_opaque = ({} if cid is None
+                     else (rt.opaque_by_client.get(cid) or getattr(rt, "opaque_legacy", {})))
+    opaque_tracks = (client_opaque or {}).get("tracks") if isinstance(client_opaque, dict) else None
+    d = REGISTRY[dialect]
+    payload = d.render(RenderContext(
+        view=view, meta_pool=rt.meta_pool, native_ids=native_ids,
+        pending_cleanup=pending_cleanup, opaque=client_opaque or {},
+        opaque_tracks=opaque_tracks, revision=rt.engine.revision,
+        generated_at=generated_at, playlist_times=pl_times,
+    ))
     data = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     etag = _canonical_etag(payload)
     # 决策（docs/03:124、docs/05:98、docs/09:159）：**永不向客户端回 304**。
@@ -1981,7 +1998,7 @@ def _sync_get(dialect: str, authorization: str, if_none_match: str = "",
 
 
 def _sync_put(dialect: str, authorization: str, body: bytes,
-              device: Optional[str] = None) -> Response:
+              device: Optional[str] = None, file: Optional[str] = None) -> Response:
     t0 = time.time()
     user = _auth_user(authorization)
     if user is None:
@@ -1993,15 +2010,45 @@ def _sync_put(dialect: str, authorization: str, body: bytes,
         _log(f"PUT /{dialect}{' device=' + device if device else ''} 403 "
              f"只读成员 {user}（角色 {_role_in(user, space)}）拒绝写入")
         return deny
+
+    rt = _hub.get(space)
+    cid = rt.client_for(user, dialect, device)
+    # 取证开关（默认关，第九轮 lx 事故后加）：设 HUB_RAW_PUT_DIR=<目录> 时，把每个 PUT 的
+    # **原文**按客户端落盘（解析结果只说明我们读到了什么，说明不了客户端到底发了什么——
+    # lx 那次"整份少一张歌单"的根因就卡在这里）。每个客户端只保留最近 20 个文件。
+    _dump_dir = os.environ.get("HUB_RAW_PUT_DIR")
+    if _dump_dir:
+        try:
+            safe = re.sub(r"[^0-9A-Za-z._-]", "_", cid)
+            d = os.path.join(_dump_dir, safe)
+            os.makedirs(d, exist_ok=True)
+            ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%S%f")
+            fn = os.path.join(d, f"{ts}_{file or 'playlists'}.json")
+            with open(fn, "wb") as fh:
+                fh.write(body)
+            _log(f"PUT /{dialect} 原文已落盘 {fn}（{len(body)} 字节）")
+            for old in sorted(os.listdir(d))[:-20]:
+                os.remove(os.path.join(d, old))
+        except Exception as exc:      # 取证失败绝不影响同步
+            _log(f"PUT 原文落盘失败：{exc!r}")
+    # 第六轮 §2.4：旁路文件（洛雪 settings.json/user_apis.json）——整文件 opaque 原样入库，
+    # 不解析、不合并、不跨设备（按客户端分桶）；blob 存原文 bytes，渲染原样归还。
+    _by = REGISTRY.get(dialect)
+    if _by is not None and file is not None and file in _by.bypass_files:
+        with rt.lock:
+            bucket = rt.opaque_by_client.setdefault(cid, {}).setdefault("lx_blobs", {})
+            bucket[file] = body
+            _hub.save(space)
+        _log(f"PUT /{dialect}/{file}{' device=' + device if device else ''} 200 旁路文件已存")
+        return JSONResponse({"ok": True})
+
     try:
         payload = json.loads(body.decode("utf-8"))
     except Exception:
         return JSONResponse({"error": "body 必须是合法 UTF-8 JSON"}, status_code=400)
 
-    rt = _hub.get(space)
-    cid = rt.client_for(user, dialect, device)
     try:
-        submission, meta_delta, opaque, _w = _PARSE[dialect](payload)
+        submission, meta_delta, opaque, _w = REGISTRY[dialect].parse(payload)
     except adapters.ParseError as exc:
         return JSONResponse({"error": f"parse failed: {exc}"}, status_code=400)
 
@@ -2010,15 +2057,12 @@ def _sync_put(dialect: str, authorization: str, body: bytes,
         # 澜音 parse_ceru 返回 opaque=None，不能把栖弦那份覆盖成空。
         if opaque and any(v is not None for v in opaque.values()):
             rt.opaque_by_client[cid] = opaque
-        # P0-A（根因 A）：提取客户端提交声明的 modifiedAt 透传引擎——
-        # 枢纽交付时间戳必须严格压过它，否则栖弦"远端时间大才采纳"会丢弃删除视图。
-        client_modified_at = None
-        try:
-            _pl_sec = (payload.get("sections") or {}).get("playlists") or {}
-            _ma = _pl_sec.get("modifiedAt")
-            if isinstance(_ma, str) and _ma:
-                client_modified_at = _ma
-        except Exception:
+        # P0-A（根因 A）：客户端提交声明的时刻由**适配器**放进 submission.client_modified_at
+        # （栖弦 = sections.playlists.modifiedAt；洛雪 = 顶层 lastModified epoch ms）。
+        # 枢纽不认任何方言字段名（加客户端不改 api.py）。交付时间戳必须严格压过它，
+        # 否则"远端时间大才采纳"的客户端会丢弃删除视图并回推。
+        client_modified_at = submission.get("client_modified_at")
+        if not isinstance(client_modified_at, str) or not client_modified_at:
             client_modified_at = None
         try:
             result = rt.merge(cid, dialect, submission, meta_delta, now=None,
@@ -2049,9 +2093,9 @@ def _sync_put(dialect: str, authorization: str, body: bytes,
         parts.append("挂起删除(安全阀)")
     no = m.get("never_owned") or {}
     if no.get("playlists") or no.get("tracks"):
-        # P0.5（第四轮）：R1 保护掉的缺席——可信端直接删（P1-3 澜音只记不删）
-        parts.append("缺席即删(未拥有)" if m.get("never_owned_applied")
-                     else "缺席仅记录(无删除能力)")
+        # 第七轮：never_owned（R1 保护掉的缺席）一律不判删——只有"自己提交过"的缺席才是
+        # 删除意图。这条日志只是排查线索（真机事故：「Yes」5 首被澜音设备一轮 PUT 带走）。
+        parts.append("缺席仅记录(未拥有，不判删)")
     if m.get("suppressed_playlists") or m.get("suppressed_tracks"):
         parts.append("墓碑压制")
     if m.get("reordered"):
@@ -2070,7 +2114,35 @@ def _sync_put(dialect: str, authorization: str, body: bytes,
     })
 
 
-# ---- 兼容端点（栖弦启动探测 / CORS 预检 / 兜底 404） ----
+# ---- 兼容端点（栖弦启动探测 / 洛雪目录探测 / CORS 预检 / 兜底 404） ----
+@app.api_route("/{path:path}", methods=["PROPFIND"])
+def webdav_propfind(path: str, request: Request) -> Response:
+    """最小合法 207 multistatus（第六轮 §1.4 第 4 条）。
+
+    洛雪（lx-x）用的 webdav@5.8.0 在上传前要 `ensureDirectoryExists()→cli.exists()→stat()`
+    与 `testConnection()→getDirectoryContents('/')`，两者都发 **PROPFIND**；该库的 `exists()`
+    只把 404 当"不存在"、其它错误照抛 ⇒ 拿到 405 会让它整轮同步直接失败。
+    这里只描述请求路径自身（Depth 0/1 同一响应），**不参与任何业务逻辑**、不读磁盘。
+    """
+    href = "/" + path.strip("/")
+    is_json = path.endswith(".json")
+    rtype = "" if is_json else "<D:collection/>"
+    body = (
+        '<?xml version="1.0" encoding="utf-8"?>'
+        '<D:multistatus xmlns:D="DAV:">'
+        f"<D:response><D:href>{href}</D:href>"
+        "<D:propstat><D:prop>"
+        f"<D:resourcetype>{rtype}</D:resourcetype>"
+        "<D:getcontentlength>0</D:getcontentlength>"
+        "<D:getlastmodified>Thu, 01 Jan 1970 00:00:00 GMT</D:getlastmodified>"
+        "</D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat>"
+        "</D:response></D:multistatus>"
+    )
+    _log(f"PROPFIND /{path} 207（最小 multistatus）")
+    return Response(content=body, media_type='application/xml; charset="utf-8"',
+                    status_code=207, headers={"DAV": "1"})
+
+
 @app.api_route("/{path:path}", methods=["MKCOL"])
 def webdav_mkcol(path: str) -> Response:
     """栖弦启动先 MKCOL {baseUrl}/CyShineMusic（webdav_client.dart），只接受 2xx/405。
@@ -2082,7 +2154,8 @@ def webdav_mkcol(path: str) -> Response:
 
 @app.options("/{path:path}")
 def webdav_options(path: str) -> Response:
-    return Response(status_code=204, headers={"Allow": "GET, PUT, OPTIONS, MKCOL"})
+    return Response(status_code=204,
+                    headers={"Allow": "GET, PUT, OPTIONS, MKCOL, PROPFIND", "DAV": "1"})
 
 
 @app.head("/{path:path}")
@@ -2091,5 +2164,28 @@ def webdav_head(path: str) -> Response:
 
 
 @app.api_route("/{path:path}", methods=["GET", "PUT", "POST", "DELETE"])
-def webdav_fallback(path: str) -> Response:
+async def webdav_fallback(path: str, request: Request,
+                          authorization: str = Header(default=""),
+                          if_none_match: str = Header(default=""),
+                          x_hub_device: str = Header(default="")) -> Response:
+    """兜底 404。第六轮 §1.4.2：文件名兜底——地址里带任意目录名时（洛雪这类客户端），
+    basename 命中某方言 files 且该方言 file_fallback=True 且方法为 GET/PUT → 分派给该方言
+    （设备段可选：path 以 /d/<设备>/ 开头时按设备段解析）。只对显式开启的方言生效；
+    /api/*、/assets/*、/ 的既有行为不变（它们都有更具体的路由，到不了这里）。
+    """
+    if request.method in ("GET", "PUT"):
+        base = path.rsplit("/", 1)[-1]
+        for _d in REGISTRY.values():
+            if _d.file_fallback and base in _d.files:
+                _log(f"WARNING 文件兜底：{path} → {_d.name}（{request.method}）")
+                path_device = None
+                m = re.match(r"^d/([^/]+)/", path)
+                if m:
+                    path_device = m.group(1)
+                dev, err = _resolve_device(path_device, x_hub_device)
+                if err is not None:
+                    return err
+                if request.method == "GET":
+                    return _sync_get(_d.name, authorization, if_none_match, device=dev, file=base)
+                return _sync_put(_d.name, authorization, await request.body(), device=dev, file=base)
     return JSONResponse({"error": "not found"}, status_code=404)
