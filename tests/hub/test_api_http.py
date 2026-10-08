@@ -167,7 +167,7 @@ class ApiHttpTest(unittest.TestCase):
     def setUpClass(cls):
         _root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
         cls._root = _root
-        cls.port = 18731 + (os.getpid() % 100)
+        cls.port = _free_port()
         cls.base = f"http://127.0.0.1:{cls.port}"
         cls.server = uvicorn.Server(uvicorn.Config(api.app, host="127.0.0.1",
                                                    port=cls.port, log_level="warning"))
@@ -263,7 +263,8 @@ class ApiHttpTest(unittest.TestCase):
         st3, h3, b3 = c.get("/CyShineMusic/sync-v1.json", {"If-None-Match": etag})
         self.assertEqual(st3, 200)
         self.assertNotEqual(h3.get("ETag"), etag)
-        self.assertEqual(_cyshine_tracks(b3)["c1"], ["tx_1", "kw_2"])
+        # 第七轮起「新增置顶」：kw_2 是这一轮新增的 → 落在最顶（用户 2026-10-08 要求覆盖所有平台）
+        self.assertEqual(_cyshine_tracks(b3)["c1"], ["kw_2", "tx_1"])
 
     # ---- P0-3：I6 本地/文件曲目 opaque 回填 ----
     def test_04_local_track_opaque_roundtrip(self):
@@ -300,7 +301,8 @@ class ApiHttpTest(unittest.TestCase):
         self.assertEqual(body["playlists"][0]["id"], "ceru-9")   # 渲染用澜音 native id
         # 栖弦侧渲染仍用其 native id，且能看到澜音新增的 B（合并成功）
         _, _, cbody = c.get("/CyShineMusic/sync-v1.json")
-        self.assertEqual(_cyshine_tracks(cbody)["n1"], ["tx_1", "kw_2"])
+        # 新增置顶：kw_2 由澜音端新加 → 栖弦侧看到它也在最顶（用户 2026-10-08 要求）
+        self.assertEqual(_cyshine_tracks(cbody)["n1"], ["kw_2", "tx_1"])
 
     # ---- P1-9：排序传播但不推进 revision（sort_tag +1） ----
     def test_06_reorder_does_not_bump_revision(self):
@@ -441,8 +443,12 @@ class ApiHttpTest(unittest.TestCase):
         _, _, state = c.get("/api/state")
         self.assertEqual(state["pendingDeletions"], [])
         # 第三轮：删除者本人 GET 跨过删除点后把 y 带回 → 显式恢复直接生效（无卡）
-        # （第四轮 P0-C：测试内关闭冷静期——真实时间下删除与恢复间隔 < 冷静期）
-        api._hub.get("main").engine.restore_grace_seconds = 0
+        # （第四轮 P0-C：测试内关闭冷静期——真实时间下删除与恢复间隔 < 冷静期。
+        #  第十三轮踩坑：直接改 engine.restore_grace_seconds 会被 policy_hook 在**下一次
+        #  Hub.get()** 按 _policy 冲回 120——本行原写法就是这样静默失效的，D32 之后
+        #  "墓碑压制" 才显形。只能改 policy。）
+        api._policy["restore_grace_seconds"] = 0
+        api._apply_engine_policy()
         c.get("/CyShineMusic/sync-v1.json")
         c.put("/CyShineMusic/sync-v1.json",
               cyshine_payload([{"id": "x", "name": "X", "tracks": []},
@@ -452,6 +458,8 @@ class ApiHttpTest(unittest.TestCase):
         _, _, body = c.get("/CyShineMusic/sync-v1.json")
         ids = [p["id"] for p in body["sections"]["playlists"]["data"]]
         self.assertIn("y", ids)                           # y 已恢复
+        api._policy["restore_grace_seconds"] = 120
+        api._apply_engine_policy()
 
     def test_13_pending_card_only_owner_can_confirm(self):
         """确认卡只能由发起账号（或 admin）处理；bob 确认 alice 的卡 → 403。
@@ -465,8 +473,13 @@ class ApiHttpTest(unittest.TestCase):
         }, config_path=None)
         alice = _Client(self.base, "alice", "pw1")
         bob = _Client(self.base, "bob", "pw2")
-        # 第四轮 P1-2：本测试需构造安全阀卡 → 关闭可信直删（恢复旧挂起行为）
-        api._hub.get("main").engine.trusted_direct_delete = False
+        # 第四轮 P1-2 / 第十轮 D27：本测试要构造"旧安全阀卡"，需显式打开旧通道
+        # （默认 confirm_delete=False + trusted_direct_delete=True → 批量删除直接生效、不挂卡）。
+        # 注意：这两个引擎开关由 policy_hook 按 _policy 重设，直接改 engine 属性会在下一次
+        # Hub.get() 时被冲掉（第十轮踩坑），所以只能改 policy。
+        api._policy["confirm_delete"] = True
+        api._policy["trusted_direct_delete"] = False
+        api._apply_engine_policy()
         # 构造 alice 的安全阀卡：提交 12 首 → 删 11 首（91.7% ≥50% 且 ≥10）→ 挂起
         alice.put("/CyShineMusic/sync-v1.json",
                   cyshine_payload([{"id": f"t{i}", "name": f"T{i}",
@@ -487,6 +500,10 @@ class ApiHttpTest(unittest.TestCase):
         # alice（owner + admin）确认 → 200
         st2, _, _ = alice.post(f"/api/pending-deletions/{pid}/confirm")
         self.assertEqual(st2, 200)
+        # 还原默认策略，别把旧通道漏给后面的用例
+        api._policy["confirm_delete"] = False
+        api._policy["trusted_direct_delete"] = True
+        api._apply_engine_policy()
 
     # ===== 多账户共用歌单修改文档 §3：空间管理 =====
     def test_14_two_accounts_same_space_share_playlists(self):
@@ -651,3 +668,17 @@ class ApiHttpTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+def _free_port() -> int:
+    """向系统要一个空闲端口。
+
+    第十二轮（测试基建）：原实现是 `18xxx + (os.getpid() % 100)` 的固定基址，
+    而本机 18787 上常驻着 DSH 的亿级上下文代理（billion-context）。某个 shell 的
+    PID%100 恰好撞上基址偏移时，uvicorn 线程起不来（winerror 10048），整卷跑就
+    表现为"偶发失败/单跑却通过"的假失败。改成向系统要端口，彻底避免撞车。
+    """
+    import socket
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return int(s.getsockname()[1])

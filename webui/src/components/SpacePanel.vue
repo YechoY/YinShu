@@ -58,7 +58,6 @@ const policy = computed(() => meData.value?.policy || {});
 /* 第三轮 §3.4：成员管理需 owner/admin；生成邀请码则 owner/admin 或（editor + policy.member_invite） */
 const canManage = (s) => !!s && (s.my_role === "owner" || isAdmin.value);
 const canInvite = (s) => !!s && (canManage(s) || (s.my_role === "editor" && policy.value.member_invite));
-const managedSpaces = computed(() => mySpaces.value.filter(canManage));   // 我可管理成员的空间
 /* 空间管理块可见性：我所在的全部空间（含只读成员——只读也能看成员表，只是不能邀请/管理） */
 const manageBlockSpaces = computed(() => mySpaces.value);
 const orphanSpaces = computed(() => allSpaces.value.filter((s) => s.orphan));

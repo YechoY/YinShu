@@ -87,7 +87,7 @@ class SpacesHttpTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls._root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-        cls.port = 18831 + (os.getpid() % 100)
+        cls.port = _free_port()
         cls.base = f"http://127.0.0.1:{cls.port}"
         cls.server = uvicorn.Server(uvicorn.Config(api.app, host="127.0.0.1",
                                                   port=cls.port, log_level="warning"))
@@ -563,3 +563,17 @@ class SpacesHttpTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+def _free_port() -> int:
+    """向系统要一个空闲端口。
+
+    第十二轮（测试基建）：原实现是 `18xxx + (os.getpid() % 100)` 的固定基址，
+    而本机 18787 上常驻着 DSH 的亿级上下文代理（billion-context）。某个 shell 的
+    PID%100 恰好撞上基址偏移时，uvicorn 线程起不来（winerror 10048），整卷跑就
+    表现为"偶发失败/单跑却通过"的假失败。改成向系统要端口，彻底避免撞车。
+    """
+    import socket
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return int(s.getsockname()[1])

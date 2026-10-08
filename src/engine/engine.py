@@ -5,7 +5,9 @@
 核心概念：
   空间 canonical     枢纽认定的"真相"（歌单 + 曲目池 + 墓碑 + revision）
   交付基线 base_served   上次真正交付给客户端的视图 + served_revision（I2′ 并发闸门与 GC 水位；
-                         与 base_submitted 的交集 = 这台设备"真的拥有过"的条目，R1 删除判据）
+                         与 base_submitted 的交集 = 这台设备"真的拥有过"的条目，R1 删除判据。
+                         例外：整份替换方言（D30，full_view_submit）与**可信客户端的歌单级**
+                         （D32）只用 base_served，见 merge()）
   提交基线 base_submitted 上次提交的视图（拥有水位；R1：仅"自己提交过"的条目才允许判删除）
   墓碑 tombstone     显式删除标记；存活期由确认水位决定（D21），不以时间为判据
 
@@ -45,8 +47,20 @@ class Client:
     identity_verified: bool = False  # 是否已越过删除点的可信身份（D21 判据）
     retired: bool = False            # >180 天无活动 → 排除在墓碑 GC 条件外
     can_delete: bool = True          # capabilities().deleteTrack（方言能力表见 adapters.CAPABILITIES；2026-10-07 起澜音也=True）
+    deliver_ack_on_view: bool = True  # 第六轮 §1 回归修复：交付（GET）"看过删除视图"能否计入确认水位。
+                                     # True=栖弦这类"看过即能应用删除、下一轮提交不再带回"的客户端；
+                                     # False=澜音这类"本地删不掉、看过必带回残留"的客户端——看过≠确认，
+                                     # 其确认只能来自 merge 的"提交不再带该键"（P1-3 意图在 can_delete=True 后
+                                     # 的等价表达；否则 deliver ack → gc 删墓碑 → 残留回推直接复活）。
+    full_view_submit: bool = False   # 第十一轮 R1 放松：提交是"整份替换"（洛雪：以远端为底 replay 后整份 PUT）
+                                     # ⇒ 交付过的条目这次缺席就是删除意图。栖弦=False（section 级 LWW 可能
+                                     # 保留自己的旧段 M1，放松会误删别人加的歌）；澜音插件=False（本地删不掉，
+                                     # 缺席可能只是导入失败）。见 merge() 里 owned_* 的注释。
+    round_trip_sources: Optional[frozenset] = None  # 该方言能原样往返回来的音源前缀（洛雪白名单）；
+                                     # None = 未知 ⇒ 放松时不判删（宁可不删，不可误删）
     base_served: Optional[ServedBaseline] = None
     base_submitted: Optional[Dict[str, dict]] = None  # 拥有水位（R1）：与 base_served 的交集构成删除判据
+                                      # （例外：整份替换方言 D30、以及**可信客户端的歌单级** D32，只用 base_served）
     opaque: dict = field(default_factory=dict)        # I6：客户端私有内容，原样携带
     first_seen_revision: int = 0
     last_seen: Optional[str] = None
@@ -79,8 +93,15 @@ class SyncSpace:
     # 结果的重加才视为显式恢复。可被 policy.restore_grace_seconds 覆盖。
     RESTORE_GRACE_SECONDS = 120
 
-    # 已适配方言（D11：未识别方言隔离存储、不跨格式合并）
+    # 已适配方言（D11：未识别方言隔离存储、不跨格式合并）。
+    # 第六轮 §1.6：由 hub.adapters 包在导入时注入注册表全量（set_known_dialects）；
+    # 未加载适配器包（engine 单测直接 import）时保留内建默认，行为不变。
     KNOWN_DIALECTS = frozenset({"cyshine-v1", "ceru-plugin"})
+
+    @classmethod
+    def set_known_dialects(cls, names) -> None:
+        """注入已知方言集（来源：hub.adapters.REGISTRY keys，见第六轮 §1.6）。"""
+        cls.KNOWN_DIALECTS = frozenset(names)
 
     def __init__(self, space_id: str = "space-a") -> None:
         self.space_id = space_id
@@ -97,7 +118,20 @@ class SyncSpace:
         self.pending_restores: Dict[str, dict] = {}   # 待确认恢复（墓碑压制；P1-1 默认关闭）
         self.quarantine: Dict[str, dict] = {}         # 未知方言隔离容器（D11）
         # 第四轮引擎策略（可被 policy 覆盖，_repair_engine_fields 兜底默认值）：
-        self.confirm_restore: bool = False            # P1-1：默认不再产生待确认恢复卡
+        # 第八轮修正：这个开关**不能**叫 confirm_restore——它与同名方法
+        # SyncSpace.confirm_restore(key)（见本文件末尾的确认通道）撞名：
+        #   ① 旧 pkl 里没有该实例属性时 hasattr() 会摸到方法（恒为真），
+        #      `_repair_engine_fields` 因此永远补不上默认值，`_note_restore` 里
+        #      `if not self.confirm_restore` 拿到的是绑定方法（真值）→ 恢复卡照旧产生；
+        #   ② 一旦实例真的写入 bool，又会遮住方法，使 /api/pending-restores/{key}/confirm
+        #      调用 `eng.confirm_restore(key)` 报 "'bool' object is not callable"。
+        # 故改名为 restore_cards_enabled，并在加载时清掉遗留的同名 bool。
+        self.restore_cards_enabled: bool = False      # P1-1：默认不再产生待确认恢复卡
+        # 第八轮（2026-10-08 用户拍板「不要再弹确认了」）：批量删除安全阀**不再产生确认卡**。
+        # False（默认）三分支见 merge()：可信端直删生效（meta.safety_valve.applied）、
+        # 不可信端既不生效也不出卡（meta.safety_valve.withheld）；
+        # True 才回到旧行为（超阈值 → 挂起 → 产生"待确认删除"卡 → 前端 PendingCard 弹确认）。
+        self.delete_cards_enabled: bool = False
         self.trusted_direct_delete: bool = True       # P1-2：可信客户端批量删除直接生效
         self.restore_grace_seconds: Optional[float] = None  # P0-C：None=用类常量
         # P0-2：确定性交付——内容（增删）真变时刻与排序真变时刻分离；
@@ -113,11 +147,17 @@ class SyncSpace:
         dialect: str = "cyshine-v1",
         identity_verified: bool = False,
         can_delete: bool = True,
+        deliver_ack_on_view: bool = True,
+        full_view_submit: bool = False,
+        round_trip_sources: Optional[frozenset] = None,
     ) -> Client:
         if client_id in self.clients:
             raise ValueError(f"client {client_id!r} 已注册")
         c = Client(client_id=client_id, dialect=dialect,
                    identity_verified=identity_verified, can_delete=can_delete,
+                   deliver_ack_on_view=deliver_ack_on_view,
+                   full_view_submit=full_view_submit,
+                   round_trip_sources=round_trip_sources,
                    first_seen_revision=self.revision)
         self.clients[client_id] = c
         return c
@@ -281,6 +321,31 @@ class SyncSpace:
             norm["__opaque__"] = client.opaque
         return canonical_hash(norm)
 
+    def _submission_matches(self, client: Client, view: Dict[str, dict]) -> bool:
+        """"客户端手上那份"是否就是"我们这次要交付的这份"。
+
+        **第十二轮（2026-10-08 用户真机：洛雪删掉的歌在栖弦里删不掉）**：客户端提交里出现过、
+        而我们**不采纳**的内容（墓碑压制 `suppressed_*`、R1 不判删的 `never_owned`、
+        安全阀 `withheld`、I2′ `suspects`）会让交付视图和它手上那份不一致。此时若还按
+        "相对上次交付内容没变"短路返回旧戳，客户端（栖弦按 section 级 LWW"远端时间更大才采纳"）
+        会认为远端没更新 → 保留本地副本 → 那首歌在设备侧**永远删不掉**，且每轮同步都回推一次
+        （每次都被压制）。所以交付戳必须压过它**自己声明的** modifiedAt（P0-A 的本意，
+        这里补上被 `same_view` 短路绕开的那一半）。
+
+        只比对客户端**声明过**的歌单：它没提交过的歌单（别人新建的）不影响判据，
+        避免"整份视图条款不同"造成每轮都推进戳（S3 写放大）。
+        """
+        sub = client.base_submitted
+        if not sub:
+            return True
+        for pl_id, e in sub.items():
+            delivered = view.get(pl_id)
+            if delivered is None:
+                return False
+            if set(e.get("tracks") or ()) != set(delivered.get("tracks") or ()):
+                return False
+        return True
+
     def _next_stamp(self, client: Client, view: Dict[str, dict]) -> str:
         """P0-2+P0-A：确定性 modifiedAt。
 
@@ -290,13 +355,15 @@ class SyncSpace:
         删除在设备侧永远不生效并被回推。实现：base = max(上次交付值, 本次提交声明)；
         交付值 = max(内容/排序最后真变时刻, base)；若无真变或真变不超过 base，
         则取 base +1ms（毫秒单调压过提交声明）。
-        仅当相对该客户端上次交付内容（含顺序）或 opaque 确有变化才推进；
-        无变化 ⇒ 原样返回上次交付值（字节全同）。"""
+        仅当相对该客户端上次交付内容（含顺序）或 opaque 确有变化，**或者客户端手上那份
+        （它上次提交的视图）仍与本次交付不同**才推进；三者都相同 ⇒ 原样返回上次交付值（字节全同）。
+        后者是第十二轮补的：被墓碑压制 / R1 不判删 / 安全阀保留的条目会让"我们交付的"与
+        "它提交的"长期不一致，只看交付视图会短路成旧戳，设备侧就永远删不掉（见 `_submission_matches`）。"""
         bsrv = client.base_served
         if bsrv is not None and bsrv.stamp:
             same_view = bsrv.view == view
             same_opaque = (bsrv.opaque_hash == canonical_hash(client.opaque or {}))
-            if same_view and same_opaque:
+            if same_view and same_opaque and self._submission_matches(client, view):
                 return bsrv.stamp
             base_src = bsrv.stamp
         else:
@@ -343,12 +410,23 @@ class SyncSpace:
         client.last_delivered_stamp = stamp
         # 交付即确认（P0-B）：交付视图不再携带该键 → ack（看过删除后视图）；
         # 该客户端后续若回推残留，merge 会把它从 acked 撤销（carried 检查）。
-        # **P1-3 配套**：can_delete=False（澜音）看过 ≠ 能应用（本地删不掉、必带回），
-        # 其"看过"不计入确认水位，否则全员 ack 会 GC 墓碑、回推直接复活。
+        # **第六轮 §1 回归修复**：P1-3 配套原依赖 can_delete=False（澜音看过 ≠ 能应用、
+        # 必带回），2026-10-07 用户拍板澜音 can_delete=True 后失效——deliver ack →
+        # 全员 ack → gc 删墓碑 → 残留回推直接复活。现改由方言能力
+        # deliver_ack_on_view 表达"看过删除视图能否计入确认水位"：栖弦=True（看过即采纳，
+        # 回推走显式恢复语义）；澜音=False（本地删不掉、看过必带回，确认只能来自 merge 的
+        # "提交不再带该键"）。can_delete=False 的端点永远不算（老行为不变）。
         if self.tombstones:
             view_track_keys = {k for e in view.values() for k in e["tracks"]}
             for key, t in self.tombstones.items():
-                if not client.can_delete:
+                if not (client.can_delete and client.deliver_ack_on_view):
+                    continue
+                # 第十二轮（真机：删除被复活）：D21 的 ack 判据是"看过删除后视图 ∧ **未再回推**"，
+                # 而这里原本只看了前半句。`carried` 记的正是"**删除之后**的某次提交里还带着这个键"
+                # ——它自己声明本地仍有这一条，说明它没应用这次删除（栖弦收到旧戳会保留本地副本、
+                # 每轮回推）。这种客户端不能算"看过即采纳"，否则它一被记 ack 就可能凑齐全员确认
+                # → GC 收走墓碑 → 它下一次回推成了**无墓碑的普通重加** = 已确认的删除被复活。
+                if t.carried and client_id in t.carried:
                     continue
                 if t.element == "playlist":
                     present = key in view
@@ -511,15 +589,17 @@ class SyncSpace:
                       client_id: Optional[str] = None) -> None:
         """登记一条"待确认恢复"候选（墓碑压制，I7/D20）。同 key 合并上下文。
 
-        **第四轮 P1-1**：默认（confirm_restore=False）不再产生待确认恢复卡——
+        **第四轮 P1-1**：默认（restore_cards_enabled=False）不再产生待确认恢复卡——
         抑制信息由 merge meta 的 suppressed_playlists/suppressed_tracks 承载，
         重加要么被墓碑压制、要么越冷静期后直接显式恢复，不需要人工确认。
-        仅当 policy.confirm_restore=True（旧行为开关）时才写 pending_restores。
+        仅当 policy.confirm_restore=True（旧行为开关，落到引擎字段
+        restore_cards_enabled；第八轮改名，原字段名与同名方法撞名，见 __init__）时
+        才写 pending_restores。
 
         多账户共用歌单 §2：补记发起客户端/账号（确认卡只能由本人/admin 处理，
         前端可显示"来自：<账号>"）。同 key 已存在时不覆盖发起者（先到先记）。
         """
-        if not self.confirm_restore:
+        if not self.restore_cards_enabled:
             return
         rec = self.pending_restores.get(key)
         if rec is None:
@@ -660,12 +740,35 @@ class SyncSpace:
         # 它可能保留自己的旧段（M1）——只按 base_served 判删除会把**别人**加的内容误判成
         # 这台设备的删除，两台手机都丢数据。交集后：别人加的、自己没提交过的条目不判删除（只并集）。
         sub_view = client.base_submitted or {}
-        owned_pl = base_keys & set(sub_view.keys())
+        # 第十一轮（2026-10-08 用户真机：lx 拉取后在本地删歌，同步不上去）：
+        # 对"整份替换型"客户端放松 R1 —— owned = base_served（交付过的）即可，不再要求
+        # "自己也提交过"。理由：洛雪拿到远端后 overwriteListFull 整份覆盖，之后的 PUT 内容
+        # = 远端视图 + 本地操作重放，所以它这次缺席、而我们交付过的条目就是它本地删掉了。
+        # 仍有三道约束：① 只对该方言能原样往返回来的音源生效（round_trip_sources；洛雪解析
+        # 把白名单外的曲目丢进 opaque，那些缺席不算删除）；② I2′ 并发闸门（期间别端写过 →
+        # 只记 suspects、不判删）；③ 安全阀。栖弦/澜音插件保持旧口径（见 Client 字段注释）。
+        full_view = bool(client.full_view_submit and client.identity_verified
+                         and not client.retired and client.can_delete)
+        # 第十三轮（2026-10-08 用户真机：lx 加的歌单在栖弦里删掉，同步不上去）：**歌单级**
+        # 再放松一档给"可信客户端"（判据与安全阀 trusted 完全一致：身份已验证 + can_delete
+        # + 未退休）。理由：栖弦的 `sections.playlists` 是**整份**导出（`exportForSync` 遍历
+        # 本地全部歌单、无过滤）且整份 LWW —— 它这次没提交的歌单，就是它本地没有的那张；
+        # 而歌单的添加**不会**自动进 base_submitted（栖弦远端胜出时 applyFromSync 整份替换本地，
+        # 那一轮 `_syncOnce` 因 merged == remote 直接 return、根本不上传），于是缺席永远落在
+        # never_owned、永远删不掉。曲目级 owned_t 不动（真机数据损失都发生在曲目层，见上面 M1/D28）。
+        trusted = (client.identity_verified and client.can_delete and not client.retired)
+        if full_view or trusted:
+            owned_pl = set(base_keys)
+        else:
+            owned_pl = base_keys & set(sub_view.keys())
         owned_t: Dict[str, Set[str]] = {}
         for pl in owned_pl:
             base = set(base_view[pl].get("tracks", ()))
-            sub = set(sub_view[pl].get("tracks", ()))
-            owned_t[pl] = base & sub
+            if full_view and client.round_trip_sources is not None:
+                owned_t[pl] = {k for k in base if k.split(":", 1)[0] in client.round_trip_sources}
+            else:
+                sub = set(sub_view[pl].get("tracks", ())) if pl in sub_view else set()
+                owned_t[pl] = base & sub
         removed_pl = owned_pl - cur_keys
 
         added_t: Dict[str, Set[str]] = {}
@@ -674,7 +777,16 @@ class SyncSpace:
             cur = set(view.get(pl, {}).get("tracks", ()))
             base = set(base_view.get(pl, {}).get("tracks", ()))
             added_t[pl] = cur - base
-            removed_t[pl] = owned_t.get(pl, set()) - cur
+            if pl in removed_pl:
+                # 第九轮（2026-10-08 真机事故「合并歌单消失，Yes 从 253 掉到 21」）：
+                # 整份歌单消失（客户端不再提交该歌单）只删**歌单本身**，不据此派生曲目级删除。
+                # 派生/合并歌单里的曲目往往同时躺在来源歌单里（真机：Yes ∩ 合并歌单 = 232/235），
+                # 按 R1 逐曲判删会写**全局墓碑**（Track.deleted_at），把来源歌单里的同一批歌一起
+                # 清空。网页端删歌单（delete_playlist）本来就只删歌单、不墓碑曲目，这里与之对齐：
+                # 删歌单的语义就是"这张歌单没了"，曲目留在库里、留在别的歌单里。
+                removed_t[pl] = set()
+            else:
+                removed_t[pl] = owned_t.get(pl, set()) - cur
 
         # P0.5（R1 配套）：被 R1 保护掉的"缺席"——base_served 有、但该设备**从未提交过**
         # （base_submitted 无）、本次提交里也没有。第三轮修改：同空间成员设备互信，
@@ -711,33 +823,45 @@ class SyncSpace:
             removed_pl = set()
             removed_t = {pl: set() for pl in removed_t}
 
-        # 第三轮修改：never_owned 缺席（可信同空间成员）→ 直接并入删除、写墓碑，不再出确认卡。
-        # 误删由墓碑 + 待确认恢复卡兜底（另一端本地残留回推时可恢复）。
-        # I2′ 并发轮次已在上方把 never_owned 降级为 suspects（旧视图不判删）。
-        # **第四轮 P1-3**：can_delete=False（澜音插件，无法删本地副本）不得走"缺席即删"——
-        # 它的"缺席"是能力缺失造成的被迫省略，不是删除意图 ⇒ 只记 meta.never_owned，不写墓碑。
-        # 保存副本供 meta 汇报；若并入后触发安全阀（批量删），随安全阀一并挂起。
+        # 第四轮 P1-3 + 第七轮真机事故（「Yes」歌单被同步带走 5 首）：
+        # never_owned 缺席**永不判删**。只有"自己提交过"（owned = base_served ∩ base_submitted）
+        # 的缺席才表达删除意图；"交付过、但从未提交过"只说明这台设备看不到 / 放不进它
+        # （导入失败、能力受限、本地副本缺失、用户还没打开过这个歌单）——把它当删除会在真机上
+        # 误删别人刚加的歌。**曲目级** can_delete=True 也不例外：能删本地 ≠ 它缺席就是删除意图。
+        # （**歌单级**自第十三轮 D32 起对可信客户端放松成 owned_pl = base_served，故这里的
+        #   never_owned_pl 对它们恒为空；仍走这条的只有 can_delete=False / 未验证 / 已退休的端点。）
+        # 这里只留副本供 meta 排查；removed_* 一概不加。I2′ 并发轮次仍并入 suspects。
         no_pl = set(never_owned_pl)
         no_t = {pl: set(ks) for pl, ks in never_owned_t.items() if ks}
-        if client.can_delete:
-            removed_pl |= never_owned_pl
-            for pl, keys in never_owned_t.items():
-                removed_t[pl] = removed_t.get(pl, set()) | keys
 
         # 安全阀（I5）：单次删除超阈值 → 挂起该批删除，其余照常应用。
         # **第四轮 P1-2**：trusted_direct_delete 空间配置（默认 True）——可信客户端
         # （身份已验证 + 有删除能力 + 未退休，即同空间互信的栖弦）批量删除直接生效，
         # 不再挂起确认卡；只有不可信/无删除能力的端点（如澜音、匿名）仍走安全阀挂起。
+        # **第八轮（2026-10-08 用户拍板「不要再弹确认了」）**：delete_cards_enabled=False
+        # （默认）时安全阀**永不产生"待确认删除"卡**。三分支：
+        #   ① 可信 + trusted_direct_delete → 直接生效（meta.safety_valve.applied 留痕）；
+        #   ② 不可信端点 → **既不生效也不出卡**：它没有删除能力，可能只是"没拿到这批曲目"，
+        #      不能据此删掉别人的歌；meta.safety_valve.withheld 留痕；
+        #   ③ policy.confirm_delete=True（delete_cards_enabled）→ 回到旧的 deferred + 挂卡通道。
         deferred = {}
-        trusted = (client.identity_verified and client.can_delete and not client.retired)
-        if self._safety_trigger(removed_pl, removed_t) \
-           and not (self.trusted_direct_delete and trusted):
-            deferred = {
+        applied_valve = None
+        withheld_valve = None
+        direct = self.trusted_direct_delete and trusted
+        if self._safety_trigger(removed_pl, removed_t):
+            batch = {
                 "playlists": sorted(removed_pl),
                 "tracks": {pl: sorted(keys) for pl, keys in removed_t.items() if keys},
             }
-            removed_pl = set()
-            removed_t = {pl: set() for pl in removed_t}
+            if direct:
+                applied_valve = batch                    # 可信直删：超阈值也直接生效
+            elif self.delete_cards_enabled:
+                deferred = batch                         # 显式开启，才回到"待确认删除"卡
+            else:
+                withheld_valve = batch                   # 默认：不挂卡、也不应用
+            if not direct:
+                removed_pl = set()
+                removed_t = {pl: set() for pl in removed_t}
 
         # ---- 事务（单写者） ----
         suppressed_pl: Set[str] = set()
@@ -760,6 +884,9 @@ class SyncSpace:
                 mutated = True
 
         # 新增曲目（并集 + (source,songId) 去重；I7 墓碑压制）
+        # 顺序（第七轮，用户拍板）：本轮新增的曲目放到歌单**最顶部**，按提交顺序排列，
+        # 不再追加到末尾。已有曲目的相对位置不动（纯重排仍由下面的「排序同步」段处理）。
+        added_head: Dict[str, List[str]] = {}
         for pl in sorted(view.keys()):
             if pl in suppressed_pl:
                 continue   # 歌单被压制 → 整单转待确认恢复，不逐曲处理
@@ -769,15 +896,21 @@ class SyncSpace:
                     if self._crossed_deletion_point(client, live):
                         del self.tombstones[key]      # 显式恢复：清墓碑
                         tr, ch = self._add_track(key, now)
-                        if self._append_to_playlist(pl, tr.tr_id, now) or ch:
+                        inserted = self._append_to_playlist(pl, tr.tr_id, now)
+                        if inserted or ch:
                             mutated = True
+                        if inserted:
+                            added_head.setdefault(pl, []).append(tr.tr_id)
                     else:
                         suppressed_t.add(key)
                         self._note_restore("track", key, now, context=pl, client_id=client_id)
                     continue
                 tr, ch = self._add_track(key, now)
-                if self._append_to_playlist(pl, tr.tr_id, now) or ch:
+                inserted = self._append_to_playlist(pl, tr.tr_id, now)
+                if inserted or ch:
                     mutated = True
+                if inserted:
+                    added_head.setdefault(pl, []).append(tr.tr_id)
 
         # 歌单改名（I4：名字不参与身份，仅展示；已有歌单直接更新）
         for pl in sorted(view.keys()):
@@ -824,6 +957,22 @@ class SyncSpace:
                 pl_.updated_at = now
                 reordered = True
 
+        # 新增置顶（第七轮，用户拍板；必须在「排序同步」之后执行）：本轮新增的曲目整体挪到
+        # 歌单最顶部，保持提交顺序；已有曲目之间的相对顺序不动。
+        # 之所以放在排序同步之后：集合相等时上面会整体改写为提交顺序，会把置顶覆盖掉
+        # （第七轮第一次改动的回归原因）。这里再执行一次，两种路径都收敛到"新增在最顶部"。
+        # 注意：不做墓碑压制检查以外的判断——只动仍在歌单里的 tid。
+        for pl, tids in added_head.items():
+            pl_ = self.playlists.get(pl)
+            if pl_ is None or pl_.deleted_at is not None:
+                continue
+            head = [tid for tid in tids if tid in pl_.track_ids]
+            if not head:
+                continue
+            head_set = set(head)
+            pl_.track_ids = head + [tid for tid in pl_.track_ids if tid not in head_set]
+            pl_.updated_at = now
+
         # 删除确认（第四轮 P0-B，D21 修订）：所有客户端的确认水位 =
         # "看过删除后视图（deliver 交付不含该键 / 本次提交不再携带该键）" ∧
         # "当前没有回推残留（最近提交不再带该键）"。
@@ -853,16 +1002,22 @@ class SyncSpace:
             self.content_changed_at = now
 
         # I1：仅提交成功后推进 base_submitted（拥有水位；R1 删除判据 = base_served ∩ base_submitted）
+        # 例外（D30 整份替换方言、D32 可信客户端的歌单级）只用 base_served，不走这个交集。
         client.base_submitted = {pl_id: {"name": e["name"], "tracks": e["tracks"]}
                                  for pl_id, e in view.items()}
 
         meta = {
             "added_playlists": sorted(added_pl),
             "removed_playlists": sorted(removed_pl),
-            "added_tracks": {pl: sorted(ks) for pl, ks in added_t.items() if ks},
+            # 第十二轮：被墓碑压制（未采纳）的键**不算新增**——旧写法把"客户端回推已删曲目"
+            # 也记成 added_tracks，日志看起来像"合并提交成功、只是没生效"，排查时误导。
+            "added_tracks": {pl: sorted(ks - suppressed_t) for pl, ks in added_t.items()
+                             if ks - suppressed_t},
             "removed_tracks": {pl: sorted(ks) for pl, ks in removed_t.items() if ks},
             "suspects": suspects,
             "deferred": deferred,
+            # 第八轮：安全阀不再弹卡，但把"超阈值的那批删除"留在 meta 里可审计
+            "safety_valve": {"applied": applied_valve, "withheld": withheld_valve},
             "suppressed_playlists": sorted(suppressed_pl),
             "suppressed_tracks": sorted(suppressed_t),
             "revision": self.revision,
@@ -883,14 +1038,13 @@ class SyncSpace:
                 client_id, None, set(deferred["playlists"]),
                 {pl: set(ks) for pl, ks in deferred["tracks"].items()}, now)
             meta["pending_delete_id"] = pid
-        # 第三轮修改：never_owned 缺席已直接删除写墓碑（见上方并入 removed），
-        # 不再出确认卡；误删由墓碑 + 待确认恢复卡兜底。
+        # 第七轮：never_owned 缺席一律不判删 ⇒ 永不为真。字段保留给旧客户端/前端兼容，
+        # 语义固定为 False（详见上方 never_owned 注释与 docs）。
         meta["never_owned"] = {
             "playlists": sorted(no_pl),
             "tracks": {pl: sorted(ks) for pl, ks in no_t.items() if ks},
         }
-        # P1-3：这些缺席是否真的写入了删除（can_delete=False 的澜音只记录不删除）
-        meta["never_owned_applied"] = bool(client.can_delete and (no_pl or no_t))
+        meta["never_owned_applied"] = False
 
         view, cleanup = self.render_for(client)
         return MergeResult(status=200, view=view, pending_cleanup=cleanup,
@@ -920,6 +1074,7 @@ class SyncSpace:
             if self._ensure_playlist(pl, view[pl]["name"], now):
                 mutated = True
                 added_pl.add(pl)
+        added_head: Dict[str, List[str]] = {}
         for pl in sorted(view.keys()):
             if pl in suppressed_pl:
                 continue
@@ -929,9 +1084,26 @@ class SyncSpace:
                     self._note_restore("track", key, now, context=pl, client_id=client.client_id)
                     continue
                 tr, ch = self._add_track(key, now)
-                if self._append_to_playlist(pl, tr.tr_id, now) or ch:
+                inserted = self._append_to_playlist(pl, tr.tr_id, now)
+                if inserted or ch:
                     mutated = True
                     added_t.setdefault(pl, []).append(key)
+                if inserted:
+                    added_head.setdefault(pl, []).append(tr.tr_id)
+
+        # 新增置顶（第八轮补：首次接入曾把新增追加到末尾，用户报"栖弦新增的歌跑到了最底下"）。
+        # 与 merge() 段同一规则：本轮新增的曲目整体挪到该歌单最顶部，按提交顺序排列；
+        # 已有序曲目之间的相对顺序不动。空间为空（真·首次建空间）时结果与"按提交顺序建单"一致。
+        for pl, tids in added_head.items():
+            pl_ = self.playlists.get(pl)
+            if pl_ is None or pl_.deleted_at is not None:
+                continue
+            head = [tid for tid in tids if tid in pl_.track_ids]
+            if not head:
+                continue
+            head_set = set(head)
+            pl_.track_ids = head + [tid for tid in pl_.track_ids if tid not in head_set]
+            pl_.updated_at = now
 
         if set(self.playlists) != before_pl:
             mutated = True
@@ -943,7 +1115,10 @@ class SyncSpace:
 
         meta = {"adopted": True,
                 "added_playlists": sorted(added_pl),
-                "added_tracks": {pl: sorted(ks) for pl, ks in added_t.items() if ks},
+                # 第十二轮：同 merge——压制掉的键不算新增（见 merge 里的注释）
+                # 注意这里 added_t 是 dict[str, list]（采纳路径按顺序收集），先转 set 再算差集
+                "added_tracks": {pl: sorted(set(ks) - suppressed_t) for pl, ks in added_t.items()
+                                 if set(ks) - suppressed_t},
                 "removed_playlists": [], "removed_tracks": {},
                 "suppressed_playlists": sorted(suppressed_pl),
                 "suppressed_tracks": sorted(suppressed_t),
@@ -975,10 +1150,17 @@ class SyncSpace:
 
         看过删除视图 = 根因 A 修好后客户端已应用删除（时间戳压过本地），不会再回推；
         一直在回推残留的设备 acked 会被 merge 撤销 ⇒ 墓碑保留 ⇒ 已确认删除不复活。
-        纯 GET / 已同步安静的设备交付即 ack ⇒ 墓碑能收走（不再永久累积）。"""
+        纯 GET / 已同步安静的设备交付即 ack ⇒ 墓碑能收走（不再永久累积）。
+
+        **第十二轮补（2026-10-08 真机事故）**：`carried` 非空 ⇒ 明知道还有客户端在往回推这个键，
+        一律不收——只靠 acked 判定会与"回推中"赛跑：某个交付瞬间它 ack 了 → 全员 ack → 收走墓碑
+        → 它下一轮回推（本地还没删掉）就把已删条目**复活**（真机 rev 21：洛雪删掉的歌又出现在
+        栖弦「纯音乐」第一位）。等它真的采纳（提交不再带该键）后 carried 清空，墓碑才收得走。"""
         now_clients = {cid: c for cid, c in self.clients.items()
                        if not c.retired and c.first_seen_revision <= self.revision}
         for key, t in list(self.tombstones.items()):
+            if t.carried:
+                continue
             if all(cid in t.acked for cid in now_clients):
                 del self.tombstones[key]
 

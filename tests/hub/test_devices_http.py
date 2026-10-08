@@ -134,7 +134,7 @@ class DeviceHttpTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls._root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-        cls.port = 18931 + (os.getpid() % 100)
+        cls.port = _free_port()
         cls.base = f"http://127.0.0.1:{cls.port}"
         cls.server = uvicorn.Server(uvicorn.Config(api.app, host="127.0.0.1",
                                                    port=cls.port, log_level="warning"))
@@ -221,6 +221,79 @@ class DeviceHttpTest(unittest.TestCase):
         st2, _, _ = c.get("/CyShineMusic/sync-v1.json", {"X-Hub-Device": "bad name"})
         self.assertEqual(st2, 400)
 
+    # ---- M8（第六轮 §3.6.1）：同账号不同设备 → 独立 client；A 删歌不影响 B 首同步 ----
+    def test_m8_devices_do_not_steal_deletions(self):
+        c = _Client(self.base, "alice", "pw1")
+        # A 设备建立基线：x + y，并 GET 一次（交付基线 = 引擎"缺席即删"的 base_served）
+        st, _, _ = c.put("/d/phone-a/CyShineMusic/sync-v1.json",
+                         _cyshine_payload([{"id": "p1", "name": "P",
+                                            "tracks": [("tx", "x", "X"), ("tx", "y", "Y")]}]))
+        self.assertIn(st, (200, 201))
+        st0, _, _ = c.get("/d/phone-a/CyShineMusic/sync-v1.json")
+        self.assertEqual(st0, 200)
+        # A 删掉 y（提交只剩 x）
+        st2, _, _ = c.put("/d/phone-a/CyShineMusic/sync-v1.json",
+                          _cyshine_payload([{"id": "p1", "name": "P", "tracks": [("tx", "x", "X")]}]))
+        self.assertIn(st2, (200, 201))
+        # B 设备首次接入：从未见过 x/y，提交空视图 → 不得误删 A 的歌
+        st3, _, _ = c.put("/d/phone-b/CyShineMusic/sync-v1.json",
+                          _cyshine_payload([{"id": "p1", "name": "P", "tracks": []}]))
+        self.assertIn(st3, (200, 201))
+        _, _, body = c.get("/d/phone-a/CyShineMusic/sync-v1.json")
+        ids = [t["musicId"] for t in body["sections"]["playlists"]["data"][0]["tracks"]]
+        self.assertIn("tx_x", ids, "B 首同步不误删 A 的歌 x")
+        self.assertNotIn("tx_y", ids, "A 自己删的 y 保持删除")
+
+    # ---- M8b（第六轮 §3.6.2）：非法设备名含中文/超长 → 400 ----
+    def test_m8b_invalid_device_name_cn_and_long_400(self):
+        from urllib.parse import quote
+        c = _Client(self.base, "alice", "pw1")
+        st, _, body = c.get(f"/d/{quote('设备名')}/CyShineMusic/sync-v1.json")
+        self.assertEqual(st, 400, "路径段中文非法")
+        self.assertIn("error", body or {})
+        st2, _, _ = c.get(f"/d/{'a' * 33}/CyShineMusic/sync-v1.json")
+        self.assertEqual(st2, 400, "路径段超长非法")
+        st4, _, _ = c.get("/CyShineMusic/sync-v1.json", {"X-Hub-Device": "b" * 33})
+        self.assertEqual(st4, 400, "头里超长非法")
+
+    # ---- M8c（第六轮 §3.6.3）：/d/<设备>/… 与默认设备（无段）互不串扰 ----
+    def test_m8c_default_and_device_isolated(self):
+        c = _Client(self.base, "alice", "pw1")
+        # default 建立基线 x + y
+        c.put("/CyShineMusic/sync-v1.json",
+              _cyshine_payload([{"id": "p1", "name": "P",
+                                 "tracks": [("tx", "x", "X"), ("tx", "y", "Y")]}]))
+        # 设备 A 首同步（从未见过 y），提交只剩 x → 不误删 default 的 y
+        st, _, _ = c.put("/d/phone-a/CyShineMusic/sync-v1.json",
+                         _cyshine_payload([{"id": "p1", "name": "P", "tracks": [("tx", "x", "X")]}]))
+        self.assertIn(st, (200, 201))
+        _, _, body = c.get("/CyShineMusic/sync-v1.json")
+        ids = [t["musicId"] for t in body["sections"]["playlists"]["data"][0]["tracks"]]
+        self.assertIn("tx_y", ids, "设备首同步不误删 default 的 y")
+        # 反过来：default 删 y → 设备 A 提交（仍含 x）→ default 视图 y 保持删除
+        c.put("/CyShineMusic/sync-v1.json",
+              _cyshine_payload([{"id": "p1", "name": "P", "tracks": [("tx", "x", "X")]}]))
+        _, _, body2 = c.get("/CyShineMusic/sync-v1.json")
+        ids2 = [t["musicId"] for t in body2["sections"]["playlists"]["data"][0]["tracks"]]
+        self.assertNotIn("tx_y", ids2, "default 自己删的 y 保持删除")
+        # 设备 A 的基线独立存在（各自 GET 都 200）
+        _, _, bodyA = c.get("/d/phone-a/CyShineMusic/sync-v1.json")
+        self.assertEqual(bodyA["sections"]["playlists"]["data"][0]["id"], "p1")
+
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def _free_port() -> int:
+    """向系统要一个空闲端口。
+
+    第十二轮（测试基建）：原实现是 `18xxx + (os.getpid() % 100)` 的固定基址，
+    而本机 18787 上常驻着 DSH 的亿级上下文代理（billion-context）。某个 shell 的
+    PID%100 恰好撞上基址偏移时，uvicorn 线程起不来（winerror 10048），整卷跑就
+    表现为"偶发失败/单跑却通过"的假失败。改成向系统要端口，彻底避免撞车。
+    """
+    import socket
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return int(s.getsockname()[1])
