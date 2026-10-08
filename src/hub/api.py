@@ -70,15 +70,13 @@ DEFAULT_POLICY = {
     "member_invite": False,       # 仅 owner/管理员可发邀请码；True 时 editor 也可
     # 第四轮引擎策略（删除免二次确认，dsh §2.4）：
     "trusted_direct_delete": True,    # P1-2：可信同空间客户端批量删除直接生效，不挂确认卡
-    "confirm_restore": False,         # P1-1：默认不产生"待确认恢复"卡（抑制由 meta 承载）
-    # 第八轮（2026-10-08 用户拍板「不要再弹确认了」）：批量删除的安全阀**默认不挂起**。
-    # False 时的两条分支（都写进 meta["safety_valve"]）：
-    #   可信端（identity_verified ∧ can_delete ∧ ¬retired，见 trusted_direct_delete）
+    # 第八轮（2026-10-08 用户拍板「不要再弹确认了」）：批量删除的安全阀**永不挂起**，
+    # 两条分支（都写进 meta["safety_valve"]）：
+    #   可信端（identity_verified ∧ can_delete ∧ ¬retired）
     #     → applied：直接生效、journal/meta 留痕；
     #   不可信端 → withheld：**既不生效也不出卡**（它表达不了"我要批量删"的意图）。
-    # True 才回到"超阈值挂起 → 产生待确认删除卡（deferred）"的旧行为。
-    # 前端 PendingCard 也按此开关渲染。
-    "confirm_delete": False,
+    # D33（2026-10-08）：确认卡通道（confirm_delete/confirm_restore 开关、
+    # pending-* 端点与前端 PendingCard）整体移除，见 docs/09 D33。
     "restore_grace_seconds": 120,     # P0-C：删除冷静期秒数（期内重加一律按残留压制）
 }
 _SPACE_ROLES = ("owner", "editor", "viewer")
@@ -133,7 +131,7 @@ def configure(hub: Hub, users: Dict[str, dict],
     _policy = dict(DEFAULT_POLICY)
     _policy.update(policy or {})
     # 第八轮：让 Hub 在每次按需加载/探测空间后立刻套用 policy（否则后加载的空间
-    # 拿不到全局 policy，旧 pkl 的恢复卡开关会一直是缺省/方法真值）
+    # 拿不到全局 policy，引擎策略字段会一直是缺省值）
     if _hub is not None:
         _hub.policy_hook = _apply_engine_policy_to
     _ensure_v3()
@@ -144,21 +142,16 @@ def _apply_engine_policy_to(eng) -> None:
     """把全局 policy 里的引擎策略套到**单个**引擎上（第八轮）。"""
     if eng is None:
         return
-    # 第八轮：清掉与同名方法撞名的遗留开关（旧 pkl 可能把 bool 写在了 confirm_restore 上）
-    if isinstance(eng.__dict__.get("confirm_restore"), bool):
-        eng.__dict__.pop("confirm_restore", None)
-    eng.restore_cards_enabled = bool(_policy.get("confirm_restore", False))
-    eng.delete_cards_enabled = bool(_policy.get("confirm_delete", False))
+    # D33：确认卡开关已移除，policy 只剩 trusted_direct_delete / restore_grace_seconds
     eng.trusted_direct_delete = bool(_policy.get("trusted_direct_delete", True))
     eng.restore_grace_seconds = _policy.get("restore_grace_seconds")
 
 
 def _apply_engine_policy() -> None:
     """把 policy 里的引擎策略（第四轮 §2.4）应用到已加载的所有空间引擎。
-    新加载的空间由 _repair_engine_fields 兜底默认值（restore_cards_enabled=False、
-    trusted_direct_delete=True、restore_grace_seconds=None→类常量），并在 Hub.get/probe
-    时通过 policy_hook 立刻套用（第八轮：按需加载的空间也要吃到 policy，否则
-    缺省的旧 pkl 会一直产生"待确认恢复"卡）。"""
+    新加载的空间由 _repair_engine_fields 兜底默认值（trusted_direct_delete=True、
+    restore_grace_seconds=None→类常量），并在 Hub.get/probe 时通过 policy_hook
+    立刻套用（第八轮：按需加载的空间也要吃到 policy）。"""
     if _hub is None:
         return
     for rt in _hub._runtimes.values():
@@ -955,8 +948,7 @@ async def api_policy_update(request: Request,
     except Exception:
         return JSONResponse({"error": "body 必须是 JSON"}, status_code=400)
     allowed = {"member_invite": bool, "user_create_space": bool,
-               "allow_self_register": bool, "trusted_direct_delete": bool,
-               "confirm_restore": bool, "confirm_delete": bool}
+               "allow_self_register": bool, "trusted_direct_delete": bool}
     changed = []
     for k, conv in allowed.items():
         if k in body:
@@ -1008,8 +1000,6 @@ def api_me(authorization: str = Header(default="")) -> JSONResponse:
             "my_quota": _quota_of(user),          # None = 不限（admin）；否则数字
             "member_invite": bool(_policy.get("member_invite", False)),
             "allow_self_register": bool(_policy.get("allow_self_register", True)),
-            "confirm_restore": bool(_policy.get("confirm_restore", False)),
-            "confirm_delete": bool(_policy.get("confirm_delete", False)),
         },
     })
 
@@ -1670,32 +1660,6 @@ def api_state(authorization: str = Header(default="")) -> JSONResponse:
                             "tracks": {_pl_name(k): _track_titles(v) for k, v in ((m.get("never_owned") or {}).get("tracks") or {}).items()}},   # P0.5
         })
 
-    # P1-1：待确认删除（安全阀挂起）与待确认恢复（墓碑压制）——UI 卡片展示
-    pending_deletions = []
-    for pid, p in eng.pending_deletions.items():
-        pending_deletions.append({
-            "id": pid,
-            "client": p.get("client"),
-            "account": p.get("account"),   # 多账户共用歌单 §2：归属账号（只能点自己的/admin 全权）
-            "reason": p.get("reason") or "safety",   # P0.5：safety（安全阀挂起）/ never_owned（R1 保护缺席）
-            "created_at": p.get("created_at"),
-            "playlists": [_pl_name(x) for x in (p.get("playlists") or [])],
-            "tracks": {_pl_name(k): len(v) for k, v in (p.get("tracks") or {}).items()},
-        })
-    pending_restores = []
-    for key, r in eng.pending_restores.items():
-        pending_restores.append({
-            "key": key,
-            "client": r.get("client"),     # 多账户共用歌单 §2：发起客户端/账号
-            "account": r.get("account"),
-            "element": r.get("element"),
-            "name": r.get("name"),
-            "origin": r.get("origin"),
-            "context": r.get("context"),
-            "created_at": r.get("created_at"),
-            "tracks": r.get("tracks") or [],
-        })
-
     # v3：当前空间成员（前端显示"谁在共用"）+ 我的空间角色
     members_out = [
         {"name": acc, "role": m.get("role", "editor"),
@@ -1718,8 +1682,6 @@ def api_state(authorization: str = Header(default="")) -> JSONResponse:
             "max_owned_spaces": _policy.get("max_owned_spaces", 3),
             "member_invite": bool(_policy.get("member_invite", False)),
             "allow_self_register": bool(_policy.get("allow_self_register", True)),
-            "confirm_restore": bool(_policy.get("confirm_restore", False)),
-            "confirm_delete": bool(_policy.get("confirm_delete", False)),
         },
         "audit": audit,
         "revision": eng.revision,
@@ -1728,85 +1690,8 @@ def api_state(authorization: str = Header(default="")) -> JSONResponse:
         "playlists": playlists,
         "clients": clients,
         "journal": journal_out,
-        "pendingDeletions": pending_deletions,
-        "pendingRestores": pending_restores,
         "meta_pool_size": len(rt.meta_pool),
     })
-
-
-# ---- P1-1：确认通道（安全阀挂起删除 / 墓碑压制恢复，docs/05 §5.3.5） ----
-@app.post("/api/pending-deletions/{pid}/confirm")
-def api_pending_delete_confirm(pid: str, authorization: str = Header(default="")) -> JSONResponse:
-    return _pending_delete_action(pid, authorization, confirm=True)
-
-
-@app.post("/api/pending-deletions/{pid}/reject")
-def api_pending_delete_reject(pid: str, authorization: str = Header(default="")) -> JSONResponse:
-    return _pending_delete_action(pid, authorization, confirm=False)
-
-
-def _pending_delete_action(pid: str, authorization: str, confirm: bool) -> JSONResponse:
-    user = _auth_user(authorization)
-    if user is None:
-        return _unauthorized()
-    space = _users[user]["space"]
-    deny = _require_role(user, space, "write")
-    if deny is not None:
-        return deny
-    rt = _hub.get(space)
-    eng = rt.engine
-    with rt.lock:
-        if pid not in eng.pending_deletions:
-            return JSONResponse({"error": "该待确认删除不存在或已处理"}, status_code=404)
-        # v3 角色：仅发起账号本人，或本空间 owner/全局 admin 可处理（viewer 已被 write 闸门拦）
-        card = eng.pending_deletions[pid]
-        if card.get("account") and card["account"] != user and _role_in(user, space) != "owner":
-            return JSONResponse({"error": "只能处理自己设备发起的确认卡（或由空间管理员处理）"}, status_code=403)
-        if confirm:
-            result = eng.confirm_delete(pid)
-            _log(f"确认通道: {user} 确认删除 {pid}（rev={result.meta.get('revision')}）")
-        else:
-            eng.reject_delete(pid)
-            _log(f"确认通道: {user} 拒绝删除 {pid}")
-        _hub.save(space)
-    return JSONResponse({"ok": True})
-
-
-@app.post("/api/pending-restores/{key:path}/confirm")
-def api_pending_restore_confirm(key: str, authorization: str = Header(default="")) -> JSONResponse:
-    return _pending_restore_action(key, authorization, confirm=True)
-
-
-@app.post("/api/pending-restores/{key:path}/reject")
-def api_pending_restore_reject(key: str, authorization: str = Header(default="")) -> JSONResponse:
-    return _pending_restore_action(key, authorization, confirm=False)
-
-
-def _pending_restore_action(key: str, authorization: str, confirm: bool) -> JSONResponse:
-    user = _auth_user(authorization)
-    if user is None:
-        return _unauthorized()
-    space = _users[user]["space"]
-    deny = _require_role(user, space, "write")
-    if deny is not None:
-        return deny
-    rt = _hub.get(space)
-    eng = rt.engine
-    with rt.lock:
-        if key not in eng.pending_restores:
-            return JSONResponse({"error": "该待确认恢复不存在或已处理"}, status_code=404)
-        # v3 角色：仅发起账号本人，或本空间 owner/全局 admin 可处理（viewer 已被 write 闸门拦）
-        rec = eng.pending_restores[key]
-        if rec.get("account") and rec["account"] != user and _role_in(user, space) != "owner":
-            return JSONResponse({"error": "只能处理自己设备发起的确认卡（或由空间管理员处理）"}, status_code=403)
-        if confirm:
-            eng.confirm_restore(key)
-            _log(f"确认通道: {user} 确认恢复 {key}")
-        else:
-            eng.reject_restore(key)
-            _log(f"确认通道: {user} 拒绝恢复 {key}")
-        _hub.save(space)
-    return JSONResponse({"ok": True})
 
 
 # ---- 同步端点（保持原语义；第六轮 §1.4 路由泛型化：按 REGISTRY 循环注册） ----
@@ -2089,8 +1974,6 @@ def _sync_put(dialect: str, authorization: str, body: bytes,
         parts.append(f"-曲目[{pl}]:{len(ks)}")
     if m.get("suspects"):
         parts.append("候选删除(他端写入)")
-    if m.get("deferred"):
-        parts.append("挂起删除(安全阀)")
     no = m.get("never_owned") or {}
     if no.get("playlists") or no.get("tracks"):
         # 第七轮：never_owned（R1 保护掉的缺席）一律不判删——只有"自己提交过"的缺席才是
@@ -2110,7 +1993,6 @@ def _sync_put(dialect: str, authorization: str, body: bytes,
         "revision": m.get("revision", rt.engine.revision),
         "sort_tag": m.get("sort_tag", rt.engine.sort_tag),
         "stamp": result.stamp,
-        "deferred": bool(m.get("deferred")),
     })
 
 

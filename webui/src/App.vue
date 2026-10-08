@@ -5,7 +5,6 @@ import PlaylistSidebar from "./components/PlaylistSidebar.vue";
 import TrackPanel from "./components/TrackPanel.vue";
 import StatusBar from "./components/StatusBar.vue";
 import AccountCenter from "./components/AccountCenter.vue";
-import PendingCard from "./components/PendingCard.vue";
 import { fetchStateRaw, fmtClock, getMe } from "./lib/api";
 import { sourceName, sourceClass } from "./lib/constants";
 
@@ -247,18 +246,6 @@ function roleLabel(r) { return ROLE_LABEL[r] || r || ""; }
           @refresh="fetchState(true)"
         />
         <div class="main-col">
-          <!-- 用户 2026-10-08「不要再弹确认了」：默认不再渲染待确认卡；
-               仅当服务端 policy 显式打开 confirm_restore/confirm_delete 时显示 -->
-          <PendingCard
-            v-if="state?.policy?.confirm_restore || state?.policy?.confirm_delete"
-            :token="token"
-            :deletions="state?.pendingDeletions || []"
-            :restores="state?.pendingRestores || []"
-            :me="user"
-            :me-is-admin="meIsAdmin"
-            :my-role="myRole"
-            @refresh="fetchState(true)"
-          />
           <TrackPanel
             :playlist="state?.playlists.find((p) => p.pl_id === active) || null"
             :token="token"
