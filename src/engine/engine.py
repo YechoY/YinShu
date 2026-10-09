@@ -39,7 +39,6 @@ class Client:
     identity_verified: bool = False
     retired: bool = False
     can_delete: bool = True
-    deliver_ack_on_view: bool = True
     full_view_submit: bool = False
     round_trip_sources: Optional[frozenset] = None
     base_served: Optional[ServedBaseline] = None
@@ -89,14 +88,13 @@ class SyncSpace:
     def register_client(
         self, client_id: str, dialect: str = "cyshine-v1",
         identity_verified: bool = False, can_delete: bool = True,
-        deliver_ack_on_view: bool = True, full_view_submit: bool = False,
+        full_view_submit: bool = False,
         round_trip_sources: Optional[frozenset] = None,
     ) -> Client:
         if client_id in self.clients:
             raise ValueError(f"client {client_id!r} 已注册")
         c = Client(client_id=client_id, dialect=dialect,
                    identity_verified=identity_verified, can_delete=can_delete,
-                   deliver_ack_on_view=deliver_ack_on_view,
                    full_view_submit=full_view_submit,
                    round_trip_sources=round_trip_sources,
                    first_seen_revision=self.revision)
