@@ -24,7 +24,7 @@ DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 RANK = {"master": 0, "atmos_plus": 1, "atmos": 2, "hires": 3, "flac24bit": 4,
         "flac": 5, "320k": 6, "192k": 7, "128k": 8}
 
-TOP_KEYS = {"schemaVersion", "generatedAt", "playlists", "tracks", "tombstones", "ext"}
+TOP_KEYS = {"schemaVersion", "generatedAt", "playlists", "tracks", "ext"}
 PL_KEYS = {"id", "name", "description", "coverUrl", "createdAt", "updatedAt", "deletedAt",
            "trackIds", "platforms", "ownerRef", "ext"}
 PLAT_KEYS = {"nativeId", "nativeName", "ext"}
@@ -36,7 +36,6 @@ Q_KEYS = {"code", "sizeBytes", "available", "ext"}
 PF_KEYS = {"songId", "mediaMid", "albumId", "qualitys", "playable", "unavailableReason", "ext"}
 NQ_KEYS = {"nativeCode", "code", "sizeBytes"}
 AVAIL_KEYS = {"state", "reason", "checkedAt"}
-TS_KEYS = {"element", "id", "deletedAt", "device", "reason"}
 
 MAX_BYTES_WARN = 1024 * 1024  # S8
 
@@ -334,23 +333,6 @@ def validate(doc: object) -> Report:
                 rep.err(f"playlists[{i}].id", f"规范 id 重复：{pl['id']}")
             pl_ids.add(pl["id"])
 
-    toms = doc.get("tombstones", [])
-    if not isinstance(toms, list):
-        rep.err("$.tombstones", "必须是数组")
-    else:
-        for i, t in enumerate(toms):
-            p = f"tombstones[{i}]"
-            if not isinstance(t, dict):
-                rep.err(p, "必须是对象")
-                continue
-            rep.check_known_keys(p, t, TS_KEYS)
-            rep.need(p, t, ("element", "id", "deletedAt"))
-            if t.get("element") not in {"track", "playlist"}:
-                rep.err(f"{p}.element", f"必须是 track/playlist，实际 {t.get('element')!r}")
-            if not isinstance(t.get("id"), str) or not t["id"]:
-                rep.err(f"{p}.id", "必须是非空字符串")
-            rep.ts(f"{p}.deletedAt", t.get("deletedAt"))
-
     return rep
 
 
@@ -375,8 +357,7 @@ def main(argv: list[str]) -> int:
     size = len(json.dumps(doc, ensure_ascii=False).encode("utf-8"))
     n_pl = len(doc.get("playlists", [])) if isinstance(doc, dict) else 0
     n_tr = len(doc.get("tracks", [])) if isinstance(doc, dict) else 0
-    n_tm = len(doc.get("tombstones", []) or []) if isinstance(doc, dict) else 0
-    print(f"\n{path}: {n_pl} 歌单 / {n_tr} 曲目 / {n_tm} 墓碑 / {size} 字节")
+    print(f"\n{path}: {n_pl} 歌单 / {n_tr} 曲目 / {size} 字节")
     print(f"结果: {len(rep.errors)} 错误 / {len(rep.warnings)} 警告")
     if size > MAX_BYTES_WARN:
         print(f"WARN  文档 {size} 字节 > 1 MiB，应当分片（S8/PF1）")
