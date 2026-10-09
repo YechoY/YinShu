@@ -224,13 +224,11 @@ yinshu/
 
 音枢能跑起来，完全是搭了这些优秀开源项目的便车：
 
-| 项目 | 为什么重要 |
-|------|-----------|
-| 🎵 [栖弦 CyShineMusic](https://github.com/KevinllBin/CyShineMusic) | 最先对接的客户端，WebDAV 同步设计规范，歌单自带 `updatedAt` 字段让合并引擎能精准判删 |
-| 🎧 [LX-X（洛雪系衍生版）](https://github.com/WalnutBai/lx-lxwalnut-music-mobile) | 最有挑战性的客户端：`playlists.json` 整文件覆盖 + 多歌单分桶，逼着引擎设计了音源白名单机制 |
-| 🎹 [澜音 CeruMusic](https://github.com/timeshiftsauce/CeruMusic) | 原生没有 WebDAV 支持，专门为它写了同步插件，"适配器插件化"的设计就从这开始（插件 SDK 等上游补充，真机验证暂缓） |
-| ⚡ [FastAPI](https://github.com/fastapi/fastapi) | 同步服务的 Web 框架 |
-| 🧰 [uv](https://github.com/astral-sh/uv) | Python 包管理，`uv run yinshu` 跨平台一条命令搞定启动 |
+- 🎵 [栖弦 CyShineMusic](https://github.com/KevinllBin/CyShineMusic) —— 率先对接的客户端，其 WebDAV 同步规范与歌单 `updatedAt` 字段，让合并引擎能精准判删
+- 🎧 [LX-X（洛雪系衍生版）](https://github.com/WalnutBai/lx-lxwalnut-music-mobile) —— 整合难度最高的客户端（整文件覆盖 + 多歌单分桶），逼出了音源白名单机制
+- 🎹 [澜音 CeruMusic](https://github.com/timeshiftsauce/CeruMusic) —— 原生无 WebDAV，专门为它写了同步插件，也催生了"适配器插件化"（插件 SDK 待上游补充）
+- ⚡ [FastAPI](https://github.com/fastapi/fastapi) —— 同步服务的 Web 框架
+- 🧰 [uv](https://github.com/astral-sh/uv) —— Python 包管理，`uv run yinshu` 一条命令跨平台启动
 
 ---
 
