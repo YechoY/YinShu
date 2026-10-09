@@ -91,8 +91,8 @@ onMounted(async () => {
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>
         </span>
         <div>
-          <h1>playlist-sync-hub</h1>
-          <p>跨平台歌单同步枢纽</p>
+          <h1>音枢 Yinshu</h1>
+          <p>跨播放器歌单同步枢纽</p>
         </div>
       </div>
 

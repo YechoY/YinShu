@@ -1,4 +1,4 @@
-"""FastAPI 版同步服务 + AList 式可视化界面（playlist-sync-hub 合并枢纽）。
+"""FastAPI 版同步服务 + AList 式可视化界面（音枢 Yinshu 合并枢纽）。
 
 保留原 server.py 的同步端点与语义（客户端零改动）：
   GET/PUT /<方言根>/<文件名>  → 按 REGISTRY 循环注册（栖弦 / 澜音插件 / 洛雪）
@@ -37,7 +37,7 @@ _WEBUI = _ROOT / "webui"
 # 路径 → 方言（第六轮 §1：单一来源 = 适配器包 REGISTRY，按 Dialect.roots/files 循环注册）
 # _ROUTES/_PARSE/_RENDER 三表已删除；路由注册见文件尾部 _register_dialect_routes()。
 
-app = FastAPI(title="playlist-sync-hub", docs_url=None, redoc_url=None, openapi_url=None)
+app = FastAPI(title="yinshu", docs_url=None, redoc_url=None, openapi_url=None)
 # Vue 工程化构建产物（webui/dist/assets）
 # 注意：dist/ 是构建产物、被 .gitignore 忽略，全新克隆或未构建的部署里可能不存在。
 # StaticFiles(check_dir=True) 在 import 期就会抛 RuntimeError，那样连 "/" 上的友好提示
@@ -569,7 +569,7 @@ def _unauthorized(webdav: bool = False) -> JSONResponse:
     """
     headers = None
     if webdav:
-        headers = {"WWW-Authenticate": 'Basic realm="playlist-sync-hub"'}
+        headers = {"WWW-Authenticate": 'Basic realm="yinshu"'}
     return JSONResponse(
         {"error": "未认证或凭据错误"},
         status_code=401,

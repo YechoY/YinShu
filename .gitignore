@@ -39,3 +39,6 @@ docs/栖弦客户端适配修改方案.md
 Thumbs.db
 .idea/
 .vscode/
+
+# 一次性排查 / 复现脚本（不是产品代码，仅本地留存）
+scripts/
