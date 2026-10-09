@@ -103,11 +103,17 @@ DIALECT = Dialect(
     capabilities={
         # 2026-10-07 用户拍板：澜音按"能删"处理——插件自身删不掉本地副本是**客户端**要解决的
         # 问题（其开发者正在处理；用户手动删掉即可），枢纽不再为它走"缺席不判删"的特殊路径。
-        # 影响：澜音提交里"少了"的曲目按删除处理（D34：段 updatedAt 变了 + 缺席 = 删）。
+        # D34 修复：澜音插件的流程是 GET → 导入远端新增 → PUT 完整本地视图，语义上等同洛雪的
+        # 整份替换 → 标记 full_view_submit 后走 owned_t = base ∩ 白名单 判删，不再依赖
+        # modified_at（ceru 线格式没有 updatedAt 字段，之前 trusted+无 modified_at 导致
+        # 单曲删除被 M1 保护静默吞掉，与上面"缺席按删除处理"的拍板脱节）。
+        # 白名单 = 插件 src/index.js 的 RESOLVABLE（只提交可解析平台，与 lx 的白名单一致）。
         "delete_track": True,
         "delete_playlist": True,
         "create_playlist": False,
         "reorder": False,
+        "full_view_submit": True,
+        "round_trip_sources": ("wy", "tx", "kw", "kg", "mg"),
     },
     empty_view_on_no_baseline=True,
     file_fallback=False,

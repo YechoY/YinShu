@@ -18,7 +18,7 @@ flowchart TB
 
 </div>
 
-**目前支持的客户端**：🎵 **栖弦（CyShineMusic）** 和 🎧 **LX-X**（洛雪系第三方衍生版，注意与官方「洛雪 LX Music」不是同一个项目）已完成真机双向同步验证；🎹 **澜音（CeruMusic）** 的服务端适配已就绪，正等上游插件 SDK 补充后做真机验证。接入新客户端只需新增一个适配器文件，无需改引擎或服务端代码。
+**目前支持的客户端**：🎵 **栖弦（CyShineMusic）** 和 🎧 **LX-X**（洛雪系第三方衍生版，注意与官方「洛雪 LX Music」不是同一个项目）已完成真机双向同步验证；🎹 **澜音（CeruMusic）** 的同步链路也已真机跑通（「音枢歌单同步」插件已投稿官方插件库），单曲自动删除在等澜音上游把插件桥接上（插件与音枢侧均已就绪，上游发版即自动生效）。接入新客户端只需新增一个适配器文件，无需改引擎或服务端代码。
 
 ---
 
@@ -226,7 +226,7 @@ yinshu/
 
 - 🎵 [栖弦 CyShineMusic](https://github.com/KevinllBin/CyShineMusic) —— 率先对接的客户端，其 WebDAV 同步规范与歌单 `updatedAt` 字段，让合并引擎能精准判删
 - 🎧 [LX-X（洛雪系衍生版）](https://github.com/WalnutBai/lx-lxwalnut-music-mobile) —— 整合难度最高的客户端（整文件覆盖 + 多歌单分桶），逼出了音源白名单机制
-- 🎹 [澜音 CeruMusic](https://github.com/timeshiftsauce/CeruMusic) —— 原生无 WebDAV，专门为它写了同步插件，也催生了"适配器插件化"（插件 SDK 待上游补充）
+- 🎹 [澜音 CeruMusic](https://github.com/timeshiftsauce/CeruMusic) —— 原生无 WebDAV，专门为它写了「音枢歌单同步」插件，也催生了"适配器插件化"（插件删除接口待上游接线）
 - ⚡ [FastAPI](https://github.com/fastapi/fastapi) —— 同步服务的 Web 框架
 - 🧰 [uv](https://github.com/astral-sh/uv) —— Python 包管理，`uv run yinshu` 一条命令跨平台启动
 
@@ -239,7 +239,7 @@ yinshu/
 - [x] 多空间 + 成员体系（owner/editor/viewer）
 - [x] 备份与恢复（前端可视化，可逆）
 - [x] 空间切换防护（切空间后重置基线）
-- [ ] 澜音插件真机验证（服务端适配已就绪，等上游 SDK 补充后接入）
+- [ ] 澜音单曲自动删除（插件与音枢侧已就绪，等上游 ceru-plugin-core 把 removeTracks 接进插件桥，发版即自动生效）
 - [ ] 栖弦 / LX-X 客户端补 `X-Hub-Device` 头（不补也能用，靠路径兜底）
 - [ ] 更多客户端接入（Spotify？Apple Music？——理论上只要有 WebDAV 同步就能接）
 
