@@ -96,8 +96,6 @@ def main():
     # 默认锚定项目根（与 cwd 无关）：`uv run yinshu` 在任何目录启动都读同一份配置
     ap.add_argument("--config", default=os.environ.get("HUB_CONFIG", str(_ROOT / "config.json")))
     ap.add_argument("--store", default=os.environ.get("HUB_STORE", str(_ROOT / "data" / "spaces")))
-    ap.add_argument("--no-open", action="store_true",
-                    help="启动后不自动打开浏览器（服务器/无界面环境用）")
     args = ap.parse_args()
 
     users, spaces, members, invites, policy = load_config(args.config)
@@ -122,26 +120,6 @@ def main():
         _file = _d.files[0] if _d.files else ""
         print(f"        {_d.name:14s} → http://{args.host}:{args.port}/{root}/{_file}")
     print(f"      认证   : Basic（用户名/密码）")
-    # 启动后自动打开管理界面（无界面环境用 --no-open 关闭）
-    if not args.no_open:
-        import socket
-        import threading
-        import time
-        import webbrowser
-        _show = "127.0.0.1" if args.host in ("0.0.0.0", "::") else args.host
-        _url = f"http://{_show}:{args.port}/"
-
-        def _open_when_ready():
-            for _ in range(50):          # 轮询端口就绪，最多约 10 秒
-                try:
-                    with socket.create_connection((_show, args.port), timeout=0.5):
-                        webbrowser.open(_url)
-                        return
-                except OSError:
-                    time.sleep(0.2)
-
-        threading.Thread(target=_open_when_ready, daemon=True).start()
-        print(f"      浏览器 : 就绪后自动打开 {_url}（--no-open 可关闭）")
     # 路径统一显示为相对项目根的形式（部署位置无关，日志可移植）
     _root_s = str(_ROOT)
     _rel = lambda p: os.path.relpath(os.path.abspath(p), _root_s)
