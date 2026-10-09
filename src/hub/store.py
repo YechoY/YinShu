@@ -125,12 +125,10 @@ class SpaceRuntime:
                 return legacy   # 老空间：沿用升级前的 client，零行为变化
         if cid not in self.engine.clients:
             caps = adapters.CAPABILITIES.get(dialect, {})
-            _d = adapters.REGISTRY.get(dialect)
             _srcs = caps.get("round_trip_sources")
             self.engine.register_client(
                 cid, dialect=dialect, identity_verified=True,
                 can_delete=bool(caps.get("delete_track", False)),
-                deliver_ack_on_view=_d.deliver_ack_on_view if _d is not None else True,
                 full_view_submit=bool(caps.get("full_view_submit", False)),
                 round_trip_sources=frozenset(_srcs) if _srcs else None)
             self._clients[cid] = dialect

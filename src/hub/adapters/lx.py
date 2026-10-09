@@ -363,6 +363,5 @@ DIALECT = Dialect(
     },
     empty_view_on_no_baseline=False,
     file_fallback=True,               # §2.7：地址带任意目录名（真机目录 LX_Muisc 打错也能命中）
-    deliver_ack_on_view=True,         # 洛雪"以远端为底 replay 后整份 PUT"：看过即应用、确认来自提交
     bypass_files=("settings.json", "user_apis.json"),   # 整文件 opaque 旁路（§2.4）
 )

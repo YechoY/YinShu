@@ -338,7 +338,7 @@ function roleLabel(r) { return ROLE_LABEL[r] || r || ""; }
 .chip-readonly { background: rgba(154, 149, 141, .18); color: #6e6a64; }
 .cur-tag { font-style: normal; font-size: 10px; color: var(--accent);
   border: 1px solid var(--accent); border-radius: 999px; padding: 0 6px; margin-left: 5px; }
-/* 退出登录确认弹窗：红色主按钮（全局 .btn-danger 仅在 .p-ops 内定义，这里补一个） */
+/* 退出登录确认弹窗：红色主按钮（旧确认卡 .p-ops 样式已随 D33 拆除，这里补全局 .btn-danger） */
 .btn-danger { background: var(--red); color: #fff; border-color: var(--red); }
 .btn-danger:hover:not(:disabled) { box-shadow: 0 8px 18px rgba(192, 101, 111, .35); transform: translateY(-1px); }
 /* 退出/重登录弹窗：图标居中、文字加深、按钮居中，两个弹窗统一精致化 */

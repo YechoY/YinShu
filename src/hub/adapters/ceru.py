@@ -103,8 +103,7 @@ DIALECT = Dialect(
     capabilities={
         # 2026-10-07 用户拍板：澜音按"能删"处理——插件自身删不掉本地副本是**客户端**要解决的
         # 问题（其开发者正在处理；用户手动删掉即可），枢纽不再为它走"缺席不判删"的特殊路径。
-        # 影响：澜音提交里"少了"的曲目按删除处理；交付即 ack 后若又回推，由 merge 的 carried
-        # 撤销确认（engine.py 的 t.acked.discard），不会让墓碑被错误 GC。
+        # 影响：澜音提交里"少了"的曲目按删除处理（D34：段 updatedAt 变了 + 缺席 = 删）。
         "delete_track": True,
         "delete_playlist": True,
         "create_playlist": False,
@@ -112,8 +111,4 @@ DIALECT = Dialect(
     },
     empty_view_on_no_baseline=True,
     file_fallback=False,
-    # 第六轮 §1 回归修复：澜音插件 SDK 缺删歌 API，本地删不掉、看过删除视图必带回残留。
-    # 故"看过视图"不计入确认水位（deliver 不 ack → 墓碑保留 → 残留回推被压制不复活）；
-    # 其确认只能来自 merge 的"提交不再带该键"。栖弦为 True（看过即采纳、回推走显式恢复）。
-    deliver_ack_on_view=False,
 )

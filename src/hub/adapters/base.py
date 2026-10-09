@@ -88,9 +88,6 @@ class Dialect:
     capabilities: dict
     empty_view_on_no_baseline: bool = False
     file_fallback: bool = False
-    deliver_ack_on_view: bool = True  # 第六轮 §1 回归修复：交付"看过删除视图"能否计入确认水位。
-                                      # True=栖弦类（看过即应用、下一轮不再带回残留）；
-                                      # False=澜音类（删不掉本地、看过必带回，确认只来自提交）。
     bypass_files: tuple = ()          # 第六轮 §2：整文件 opaque 旁路（如洛雪 settings.json /
                                       # user_apis.json）：PUT 原样入库、GET 原样归还（按客户端分桶），
                                       # 不解析、不合并、不跨设备。空=不走旁路。
