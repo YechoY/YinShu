@@ -90,16 +90,16 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 **Windows**（PowerShell）：
 
 ```powershell
-git clone https://github.com/YechoY/yinshu.git yinshu
-cd yinshu
+git clone https://github.com/YechoY/YinShu.git YinShu
+cd YinShu
 .\run.ps1
 ```
 
 **Linux / macOS / WSL**：
 
 ```bash
-git clone https://github.com/YechoY/yinshu.git yinshu
-cd yinshu
+git clone https://github.com/YechoY/YinShu.git YinShu
+cd YinShu
 ./run.sh
 ```
 
