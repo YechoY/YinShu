@@ -29,8 +29,15 @@ from hub.store import Hub
 def cyshine_payload(playlists: list, local_tracks: dict = None) -> dict:
     """栖弦 payload。playlists: [{id,name,tracks:[(src,sid,title)]}]
     local_tracks: {playlist_id: [原始 track 对象]} —— 本地/文件曲目（I6 opaque）。"""
+    global _cyshine_ts_counter
+    try:
+        _cyshine_ts_counter += 1
+    except NameError:
+        _cyshine_ts_counter = 1
+    from datetime import datetime, timezone, timedelta
+    _base = datetime(2026, 10, 5, tzinfo=timezone.utc)
     data = []
-    for pl in playlists:
+    for i, pl in enumerate(playlists):
         tracks = []
         for src, sid, title in pl["tracks"]:
             tracks.append({
@@ -44,9 +51,10 @@ def cyshine_payload(playlists: list, local_tracks: dict = None) -> dict:
             })
         if local_tracks and str(pl["id"]) in local_tracks:
             tracks.extend(local_tracks[str(pl["id"])])
+        ts = (_base + timedelta(seconds=_cyshine_ts_counter + i)).strftime("%Y-%m-%dT%H:%M:%SZ")
         data.append({"version": 1, "id": pl["id"], "name": pl["name"],
                      "tracks": tracks, "createdAt": "2026-10-05T00:00:00Z",
-                     "updatedAt": "2026-10-05T00:00:00Z"})
+                     "updatedAt": ts})
     return {"schemaVersion": 1, "generatedAt": "2026-10-05T00:00:00Z",
             "sections": {"playlists": {"data": data},
                          "appearance": {"data": {"themeSeedArgb": 4289230000}},
@@ -374,12 +382,12 @@ class ApiHttpTest(unittest.TestCase):
         _, _, lb = lan.get("/ceru/sync-v1.json")
         song_ids = {t.get("songId") for pl in lb["playlists"] for t in pl["tracks"]}
         self.assertNotIn("2", song_ids)
-        # 澜音（本地删不掉）推回 tx2 → 墓碑压制，栖弦视图不复活（D33：不再有恢复卡）
+        # 澜音（本地删不掉）推回 tx2 → D34：加回来就加回来（无墓碑压制）
         lan.put("/ceru/sync-v1.json",
                 ceru_payload([{"id": "ceru-d", "name": "删",
                                "tracks": [("tx", "1", "歌A"), ("tx", "2", "歌B")]}]))
         _, _, cb = c.get("/CyShineMusic/sync-v1.json")
-        self.assertNotIn("tx_2", _cyshine_tracks(cb)["d1"])   # 被压制，不复活
+        self.assertIn("tx_2", _cyshine_tracks(cb)["d1"])   # 加回来就恢复
 
     # ===== 多账户共用歌单修改文档 §1：opaque 按客户端隔离 =====
     def test_11_opaque_isolated_between_clients(self):

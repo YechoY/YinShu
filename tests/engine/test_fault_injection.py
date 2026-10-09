@@ -1,7 +1,7 @@
-"""故障注入与语义校验（docs/07 §7.4 测试策略 + §5.6 错误与回滚）。
+"""故障注入与语义校验（D34 简化后）。
 
-覆盖：坏 JSON 拒绝、I2' revision 闸门、安全阀挂起、base_served 语义（I1/F3）、
-幂等收敛（I4）、墓碑压制（I7）、确认水位 GC（D21/T3）。
+覆盖：坏 JSON 拒绝、段没动不判删（M1 保护）、untrusted 删 owned 生效、
+base_served 语义（I1/F3）、幂等收敛（I4）、删除后加回来就恢复。
 """
 from __future__ import annotations
 
@@ -30,8 +30,6 @@ class TestFaultInjection(unittest.TestCase):
 
     def setUp(self):
         self.sp = SyncSpace("fi")
-        # 第四轮 P0-C：测试默认关闭冷静期（GC 只靠确认水位）；冷静期专项测试单独设大值
-        self.sp.restore_grace_seconds = 0
         self.sp.register_client("A", dialect="cyshine-v1", identity_verified=True)
         self.sp.register_client("B", dialect="cyshine-v1", identity_verified=True)
 
@@ -47,31 +45,27 @@ class TestFaultInjection(unittest.TestCase):
             self.assertEqual(r.status, 400, msg=f"bad={bad!r}")
         self.assertEqual(self.sp.revision, rev)
 
-    # I2' revision 闸门：期间有别端写过 → 本次禁止产生删除（只并集 + 记候选）
-    def test_revision_gate_blocks_deletion(self):
+    # M1 保护：trusted 客户端段没 modified_at 变化 → 缺席不判删
+    def test_stale_view_no_mod_change_no_delete(self):
         self.sp.merge("A", sub(pl("p1", "歌单", ("tx", "x"))))
-        self.sp.deliver("A")                      # A.base_served = rev1
-        self.sp.merge("B", sub(pl("p1", "歌单", ("tx", "x"), ("wy", "y"))))  # B 加 y → rev2
+        self.sp.deliver("A")
+        self.sp.merge("B", sub(pl("p1", "歌单", ("tx", "x"), ("wy", "y"))))
         self.sp.deliver("B")
-        # A 拿旧视图(rev1)回写"删掉 x" → 闸门：不删除，只记 suspects
+        # A 拿旧视图回写"删掉 x"，但段没 modified_at 变化 → M1 保护 → 不删
         r = self.sp.merge("A", sub(pl("p1", "歌单")))
-        self.assertTrue(r.meta["suspects"])
         self.assertEqual(live_keys(self.sp, "歌单"), {"tx:x", "wy:y"})  # 未删除
 
-    # 安全阀（不可信端点）：单次删除超阈值 → 新增照常、该批删除既不生效也不出卡
-    # （D33：确认卡通道已整体移除；不可信端 withholding 由 meta.safety_valve 留痕）
-    def test_safety_valve_withheld_for_untrusted(self):
-        self.sp.trusted_direct_delete = False
-        self.sp.merge("A", sub(pl("p1", "歌单", *[("tx", f"t{i}") for i in range(12)])))
-        self.sp.deliver("A")
-        # 同时删 11 首（触发）并新增 z → 新增照常应用，删除 withheld
-        r = self.sp.merge("A", sub(pl("p1", "歌单", ("tx", "t0"), ("tx", "z"))))
+    # D34：untrusted 客户端删 owned 曲目 → 删生效（无安全阀拦截）
+    def test_untrusted_bulk_delete(self):
+        CE = self.sp.register_client("CE", dialect="ceru-plugin",
+                                     identity_verified=True, can_delete=False)
+        self.sp.merge("CE", sub(pl("p1", "歌单", *[("tx", f"t{i}") for i in range(12)])))
+        self.sp.deliver("CE")
+        # CE 删 11 首 + 新增 z → 删 owned(t1..t11) 生效，z 并入
+        r = self.sp.merge("CE", sub(pl("p1", "歌单", ("tx", "t0"), ("tx", "z"))))
         self.assertEqual(r.status, 200)
-        self.assertTrue(r.meta["safety_valve"]["withheld"])
-        self.assertIsNone(r.meta["safety_valve"]["applied"])
-        self.assertIn("tx:z", live_keys(self.sp, "歌单"))   # 新增已应用
-        self.assertEqual(len(self.sp.tombstones), 0)        # 删除未写墓碑
-        self.assertEqual(len(live_keys(self.sp, "歌单")), 13)  # 12 原曲 + z，删除仍含（D4）
+        self.assertIn("tx:z", live_keys(self.sp, "歌单"))
+        self.assertEqual(live_keys(self.sp, "歌单"), {"tx:t0", "tx:z"})
 
     # I1 / F3：PUT 响应体不算交付，base_served 只在 GET 后推进
     def test_base_served_advances_only_on_get(self):
@@ -89,74 +83,60 @@ class TestFaultInjection(unittest.TestCase):
         for _ in range(5):
             self.sp.merge("A", sub(pl("p1", "歌单", ("tx", "x"))))
         self.assertEqual(self.sp.revision, rev)
-        # 已删除的条目被未验证新身份反复提交 → 一致压制（幂等），不复活
-        # （D33：确认卡通道已移除，抑制信息由 meta.suppressed_tracks 承载）
-        self.sp.merge("A", sub(pl("p1", "歌单")))
+        # D34：删除后加回来就恢复（无冷静期压制）
+        self.sp.merge("A", sub(pl("p1", "歌单", modified_at="2026-10-09T12:00:00Z")))
         self.sp.deliver("A")
-        self.sp.register_client("D", dialect="cyshine-v1", identity_verified=False)
-        for _ in range(3):
-            r = self.sp.merge("D", sub(pl("p1", "歌单", ("tx", "x"))))
-            self.assertNotIn("tx:x", live_keys(self.sp, "歌单"))
-            self.assertIn("tx:x", r.meta["suppressed_tracks"])
+        self.assertNotIn("tx:x", live_keys(self.sp, "歌单"))
+        self.sp.merge("A", sub(pl("p1", "歌单", ("tx", "x"),
+                                 modified_at="2026-10-09T12:01:00Z")))
+        self.assertIn("tx:x", live_keys(self.sp, "歌单"))  # 加回来就恢复
 
-    # D21：确认水位 GC（第四轮 P0-B）——所有已注册客户端都**看过删除后视图**
-    # （deliver 交付不含该键 → ack；merge 提交确认同样 ack）才 GC；
-    # 回推残留（carried）会撤销 ack，墓碑继续存活压制
-    def test_tombstone_gc_by_ack_watermark(self):
-        self.sp.merge("A", sub(pl("p1", "歌单", ("tx", "x"))))
-        self.sp.deliver("A")
-        self.sp.merge("B", sub(pl("p1", "歌单", ("tx", "x"))))  # B 已注册但未交付
-        self.sp.merge("A", sub(pl("p1", "歌单")))  # A 删除 x（A 提交确认 ack）
-        self.assertIn("tx:x", self.sp.tombstones)   # B 未看过删除视图 → 不 GC
-        self.sp.deliver("B")                        # B 交付不含 x → 看过删除视图 → ack
-        self.assertNotIn("tx:x", self.sp.tombstones)  # 全员确认 → GC
-        # B 又把 x 带回（残留回推）→ 无墓碑 → 正常并入（恢复/重加按当前判据处理）
-        r = self.sp.merge("B", sub(pl("p1", "歌单", ("tx", "x"))))
-        self.assertIn("tx:x", live_keys(self.sp, "歌单"))
-
-    # 第四轮 P0-B（§4.1 点名）：全员看过删除视图后墓碑 GC，且该客户端之后 PUT
-    # 不带该键（已应用删除，时间戳压过本地），空间不再保留任何删除痕迹
-    def test_tombstone_gc_after_all_clients_saw_deletion(self):
+    # D34：删除后加回来就恢复（无墓碑、无冷静期）
+    def test_delete_then_readd_restores(self):
         self.sp.merge("A", sub(pl("p1", "歌单", ("tx", "x"))))
         self.sp.deliver("A")
         self.sp.merge("B", sub(pl("p1", "歌单", ("tx", "x"))))
         self.sp.deliver("B")
-        self.sp.deliver("A")                 # A 删前对齐
-        self.sp.merge("A", sub(pl("p1", "歌单")))   # A 删除 x
-        self.assertIn("tx:x", self.sp.tombstones)
-        self.sp.deliver("B")                 # B 看过删除视图 → ack
-        self.assertNotIn("tx:x", self.sp.tombstones)   # A/B 全员确认 → GC
-        # 之后 B PUT 不含该键（删除已应用，根因 A 修复后时间戳压过本地）
-        r = self.sp.merge("B", sub(pl("p1", "歌单")))
-        self.assertNotIn("tx:x", r.meta["suppressed_tracks"])
+        # A 删 x（段 modified_at 变化 → 判删）
+        self.sp.merge("A", sub(pl("p1", "歌单", modified_at="2026-10-09T12:00:00Z")))
+        self.assertNotIn("tx:x", live_keys(self.sp, "歌单"))
+        # B 回推 x → 加回来就恢复
+        self.sp.merge("B", sub(pl("p1", "歌单", ("tx", "x"))))
+        self.assertIn("tx:x", live_keys(self.sp, "歌单"))
+
+    # D34：删除传播后保持删除，直到有人加回来
+    def test_delete_propagates_and_stays(self):
+        self.sp.merge("A", sub(pl("p1", "歌单", ("tx", "x"))))
+        self.sp.deliver("A")
+        self.sp.merge("B", sub(pl("p1", "歌单", ("tx", "x"))))
+        self.sp.deliver("B")
+        self.sp.deliver("A")
+        # A 删 x（段没 modified_at → M1 保护 → 不删）
+        # 需要让 A 提交时 modified_at 变化才能判删
+        self.sp.merge("A", sub(pl("p1", "歌单", modified_at="2026-10-09T12:00:00Z")))
+        self.assertNotIn("tx:x", live_keys(self.sp, "歌单"))
+        # B 看到删除结果
+        self.sp.deliver("B")
+        self.assertNotIn("tx:x", live_keys(self.sp, "歌单"))
+        # B PUT 不含 x → 删除保持（无墓碑压制，但也没人加回来）
+        self.sp.merge("B", sub(pl("p1", "歌单")))
         self.assertNotIn("tx:x", live_keys(self.sp, "歌单"))
 
-    # 第四轮 P0-B：客户端持续回推已删条目 → 墓碑不被 GC、回推被压制
-    # （构造：C 从未看过删除视图，钉住确认水位；B 看过但回推 → ack 撤销）
-    def test_tombstone_survives_when_client_keeps_repushing(self):
-        # 冷静期打开（回推按残留压制；0 秒冷静期下"看过+回推"会走显式恢复）
-        self.sp.restore_grace_seconds = 3600
+    # D34：持续回推 → 加回来就加回来（无压制）
+    def test_readd_always_restores(self):
         self.sp.merge("A", sub(pl("p1", "歌单", ("tx", "x"))))
         self.sp.deliver("A")
         self.sp.register_client("C", dialect="cyshine-v1", identity_verified=True)
         self.sp.merge("B", sub(pl("p1", "歌单", ("tx", "x"))))
         self.sp.deliver("B")
         self.sp.merge("C", sub(pl("p1", "歌单", ("tx", "x"))))
-        self.sp.deliver("A")   # A 对齐
-        self.sp.merge("A", sub(pl("p1", "歌单")))   # A 删 x（A 提交确认）
-        self.sp.deliver("B")                        # B 看过删除视图 → ack（C 未确认 → 不 GC）
-        self.assertIn("tx:x", self.sp.tombstones)
-        # B 回推 x → 冷静期内 → 压制；carried → ack(B) 撤销，墓碑继续存活
-        r = self.sp.merge("B", sub(pl("p1", "歌单", ("tx", "x"))))
-        self.assertIn("tx:x", r.meta["suppressed_tracks"])
-        self.assertIn("tx:x", self.sp.tombstones)
+        self.sp.deliver("A")
+        # A 删 x（段 modified_at 变化 → 判删）
+        self.sp.merge("A", sub(pl("p1", "歌单", modified_at="2026-10-09T12:00:00Z")))
         self.assertNotIn("tx:x", live_keys(self.sp, "歌单"))
-        # C 也看过删除视图 → 全员 ack？B 已撤销 → 未全员 → 墓碑仍存活
-        self.sp.deliver("C")
-        self.assertIn("tx:x", self.sp.tombstones)
-        # B 最终删掉本地（提交空视图）→ ack(B) 恢复 → 全员看过 → GC（第四轮 P0-B 简单版）
-        self.sp.merge("B", sub(pl("p1", "歌单")))
-        self.assertNotIn("tx:x", self.sp.tombstones)
+        # B 回推 x → 加回来就恢复（无冷静期压制）
+        self.sp.merge("B", sub(pl("p1", "歌单", ("tx", "x"))))
+        self.assertIn("tx:x", live_keys(self.sp, "歌单"))
 
     # 并发串行化：多次交错 PUT 后，全客户端视图一致、revision 有界
     def test_serialized_interleave_bounded(self):

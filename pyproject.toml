@@ -1,13 +1,18 @@
 [project]
-name = "playlist-sync-hub"
+name = "yinshu"
 version = "0.1.0"
-description = "跨平台歌单同步枢纽：澜音 / 栖弦 双端合并同步（canonical 统一模型 + 三路合并引擎）"
+description = "音枢：跨播放器歌单同步枢纽（canonical 统一模型 + 增量合并引擎）"
 readme = "README.md"
+license = "PolyForm-Noncommercial-1.0.0"
 requires-python = ">=3.10"
 dependencies = [
     "fastapi>=0.115",
     "uvicorn[standard]>=0.30",
 ]
+
+# 跨平台启动入口：任何系统上 `uv run yinshu` 即可（等价于 python -m hub.run_fastapi）
+[project.scripts]
+yinshu = "hub.run_fastapi:main"
 
 [dependency-groups]
 dev = [

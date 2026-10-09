@@ -544,14 +544,14 @@ class SpacesHttpTest(unittest.TestCase):
         self.b.get("/CyShineMusic/sync-v1.json")
         self.assertEqual(self.b.put("/CyShineMusic/sync-v1.json",
                                     cyshine_payload([]))[0], 200)
-        # bob 看过删除视图后重加 → 冷静期（默认 120s）内按残留压制（不复活）
+        # bob 看过删除视图后重加 → D34：加回来就加回来（无冷静期压制）
         self.b.get("/CyShineMusic/sync-v1.json")
         self.assertEqual(self.b.put("/CyShineMusic/sync-v1.json",
                                     cyshine_payload([{"id": "p1", "name": "家",
                                                       "tracks": [("tx", "1", "歌A")]}]))[0], 200)
         _, _, body = self.b.get("/CyShineMusic/sync-v1.json")
         ids = [pl["id"] for pl in body["sections"]["playlists"]["data"]]
-        self.assertNotIn("p1", ids)   # 冷静期内回推被压制，不复活（§2.4.3-②）
+        self.assertIn("p1", ids)   # D34：加回来就恢复
 
 
 if __name__ == "__main__":

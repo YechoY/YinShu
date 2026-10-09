@@ -64,7 +64,13 @@ def parse_cyshine(payload: dict) -> Tuple[dict, Dict[str, dict], dict, List[str]
             for k, v in meta.items():
                 if v is not None and k not in merged:
                     merged[k] = v
-        playlists.append({"native_id": str(pl_id), "name": name, "tracks": tracks})
+        # 第十五轮：带上歌单级 updatedAt（用户数据的段修改时刻）——引擎用它区分
+        # "真编辑过该歌单"（缺席曲目=删除意图）与"未采纳远端内容"（缺席≠删除，M1 保护）。
+        # 格式容错：栖弦历史数据 updatedAt 有带 Z / 不带 Z 两种，这里只透传字符串，
+        # 引擎侧仅做"是否变化"比较，不解析时刻。
+        updated_at = item.get("updatedAt")
+        playlists.append({"native_id": str(pl_id), "name": name, "tracks": tracks,
+                          "modified_at": updated_at if isinstance(updated_at, str) and updated_at else None})
         if local:
             opaque_tracks[str(pl_id)] = local
             warnings.append(f"歌单 {pl_id} 含 {len(local)} 首本地/文件曲目（按 I6 opaque 携带）")
@@ -99,6 +105,9 @@ def _cyshine_track_identity(track) -> Optional[Tuple[str, str, dict]]:
         mid = track.get("musicId") or ""
         if isinstance(mid, str) and src and mid.startswith(str(src) + "_"):
             song_id = mid[len(str(src)) + 1:]
+    # songId 可能是 int（网易/QQ 等平台 id 在 JSON 里是数字），统一转 str
+    if isinstance(song_id, int) and not isinstance(song_id, bool):
+        song_id = str(song_id)
     if not isinstance(src, str) or not src or not isinstance(song_id, str) or not song_id:
         return None   # 本地文件 / 无平台 id → I6 opaque 原样携带
 
@@ -147,12 +156,18 @@ def render_cyshine(view: Dict[str, dict], meta_pool: Dict[str, dict],
         })
 
     opaque = opaque or {}
+    # 第十四轮修复：默认值补全只针对**缺失**的 section——有 data 但缺 modifiedAt 的
+    # 真实数据必须保留（只补时间戳），此前一刀切替换会把用户上传的主题/音源丢成默认 0。
     appearance = opaque.get("appearance")
-    if not isinstance(appearance, dict):
-        appearance = {"data": {"themeSeedArgb": 0}}   # 硬要求 2：必须是 JSON 整数
+    if not isinstance(appearance, dict) or "data" not in appearance:
+        appearance = {"data": {"themeSeedArgb": 0}, "modifiedAt": generated_at}
+    elif "modifiedAt" not in appearance:
+        appearance = {**appearance, "modifiedAt": generated_at}
     music_sources = opaque.get("musicSources")
-    if not isinstance(music_sources, dict):
-        music_sources = {"data": []}
+    if not isinstance(music_sources, dict) or "data" not in music_sources:
+        music_sources = {"data": [], "modifiedAt": generated_at}
+    elif "modifiedAt" not in music_sources:
+        music_sources = {**music_sources, "modifiedAt": generated_at}
 
     return {
         "schemaVersion": 1,

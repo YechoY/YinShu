@@ -26,8 +26,15 @@ from hub.store import Hub
 
 
 def _cyshine_payload(playlists):
+    global _cyshine_ts_counter
+    try:
+        _cyshine_ts_counter += 1
+    except NameError:
+        _cyshine_ts_counter = 1
+    from datetime import datetime, timezone, timedelta
+    _base = datetime(2026, 10, 5, tzinfo=timezone.utc)
     data = []
-    for pl in playlists:
+    for i, pl in enumerate(playlists):
         tracks = []
         for src, sid, title in pl["tracks"]:
             tracks.append({
@@ -39,9 +46,10 @@ def _cyshine_payload(playlists):
                     "meta": {"songId": sid},
                 },
             })
+        ts = (_base + timedelta(seconds=_cyshine_ts_counter + i)).strftime("%Y-%m-%dT%H:%M:%SZ")
         data.append({"version": 1, "id": pl["id"], "name": pl["name"],
                      "tracks": tracks, "createdAt": "2026-10-05T00:00:00Z",
-                     "updatedAt": "2026-10-05T00:00:00Z"})
+                     "updatedAt": ts})
     return {"schemaVersion": 1, "generatedAt": "2026-10-05T00:00:00Z",
             "sections": {"playlists": {"data": data},
                          "appearance": {"data": {"themeSeedArgb": 4289230000}},

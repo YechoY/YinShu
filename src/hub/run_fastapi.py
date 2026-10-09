@@ -1,9 +1,10 @@
-"""FastAPI 版 hub 启动入口（playlist-sync-hub）。
+"""FastAPI 版 hub 启动入口（音枢 Yinshu）。
 
 用法（在项目根目录）：
-    uv run python -m hub.run_fastapi                     # 默认 127.0.0.1:8000
-    uv run python -m hub.run_fastapi --host 0.0.0.0      # 手机栖弦局域网联调
-    uv run python -m hub.run_fastapi --port 8000 --config config.json
+    uv run yinshu                                        # 默认 127.0.0.1:8000（推荐，跨平台）
+    uv run yinshu --host 0.0.0.0                         # 手机栖弦局域网联调
+    uv run yinshu --port 8000 --config config.json
+    uv run python -m hub.run_fastapi                     # 等价写法
 
 配置与认证语义与旧版 run.py 一致（config.json / HUB_USER / 默认 admin:admin123）。
 启动后浏览器打开 http://127.0.0.1:8000/ 即是可视化界面。
@@ -89,11 +90,12 @@ def load_config(path: str):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="playlist-sync-hub FastAPI 同步服务 + 可视化界面")
+    ap = argparse.ArgumentParser(description="音枢 Yinshu：FastAPI 同步服务 + 可视化界面")
     ap.add_argument("--host", default=os.environ.get("HUB_HOST", "127.0.0.1"))
     ap.add_argument("--port", type=int, default=int(os.environ.get("HUB_PORT", "8000")))
-    ap.add_argument("--config", default=os.environ.get("HUB_CONFIG", "config.json"))
-    ap.add_argument("--store", default=str(_ROOT / "data" / "spaces"))
+    # 默认锚定项目根（与 cwd 无关）：`uv run yinshu` 在任何目录启动都读同一份配置
+    ap.add_argument("--config", default=os.environ.get("HUB_CONFIG", str(_ROOT / "config.json")))
+    ap.add_argument("--store", default=os.environ.get("HUB_STORE", str(_ROOT / "data" / "spaces")))
     args = ap.parse_args()
 
     users, spaces, members, invites, policy = load_config(args.config)
@@ -106,15 +108,24 @@ def main():
     configure(hub, users, config_path=args.config,
               spaces=spaces, members=members, invites=invites, policy=policy)
     from .api import _policy as _pol
+    from .adapters import REGISTRY
     user = next(iter(users))
-    print("[hub] FastAPI 同步服务已启动")
+    print("[hub] FastAPI 同步服务 音枢 已启动")
     print(f"      监听   : http://{args.host}:{args.port}")
     print(f"      账号   : {user}  /  空间 : {users[user]['space']}  /  角色 : {users[user]['role']}")
     print(f"      界面   : http://{args.host}:{args.port}/")
-    print(f"      栖弦   : http://{args.host}:{args.port}/CyShineMusic/sync-v1.json")
-    print(f"      澜音   : http://{args.host}:{args.port}/ceru/sync-v1.json")
+    print("      同步路由:")
+    for _name, _d in REGISTRY.items():
+        root = _d.roots[0] if _d.roots else _name
+        _file = _d.files[0] if _d.files else ""
+        print(f"        {_d.name:14s} → http://{args.host}:{args.port}/{root}/{_file}")
     print(f"      认证   : Basic（用户名/密码）")
-    print(f"      数据   : {os.path.abspath(args.store)}")
+    # 路径统一显示为相对项目根的形式（部署位置无关，日志可移植）
+    _root_s = str(_ROOT)
+    _rel = lambda p: os.path.relpath(os.path.abspath(p), _root_s)
+    print(f"      项目根 : {_root_s}")
+    print(f"      配置   : {_rel(args.config)}")
+    print(f"      数据   : {_rel(args.store)}")
     print(f"      政策   : 允许自助建空间={'是' if _pol.get('user_create_space') else '否'}"
           f"（配额 {_pol.get('max_owned_spaces')}），成员可邀请={'是' if _pol.get('member_invite') else '否'}"
           f"，邀请码注册={'是' if _pol.get('allow_self_register') else '否'}")

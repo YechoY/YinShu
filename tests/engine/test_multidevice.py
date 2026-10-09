@@ -23,9 +23,12 @@ from hub import adapters  # noqa: E402,F401  给 SyncSpace.KNOWN_DIALECTS 注入
 from hub.store import SpaceRuntime   # noqa: E402
 
 
-def sub(pairs, name="P", nid="lx-1"):
-    return {"playlists": [{"native_id": nid, "name": name,
-                           "tracks": [{"source": s, "songId": i} for s, i in pairs]}]}
+def sub(pairs, name="P", nid="lx-1", modified_at=None):
+    pl = {"native_id": nid, "name": name,
+          "tracks": [{"source": s, "songId": i} for s, i in pairs]}
+    if modified_at is not None:
+        pl["modified_at"] = modified_at
+    return {"playlists": [pl]}
 
 
 def canon_keys(sp, client):
@@ -45,8 +48,6 @@ class MultiDeviceEngineTest(unittest.TestCase):
 
     def _space(self):
         sp = SyncSpace(f"space:multidevice-{os.getpid()}-{id(self)}")
-        # 第四轮 P0-C：测试默认关闭冷静期（恢复/GC 语义立即生效）；专项测试单独设大值
-        sp.restore_grace_seconds = 0
         return sp
 
     def _dev(self, sp, did, dialect="cyshine-v1"):
@@ -119,7 +120,6 @@ class MultiDeviceEngineTest(unittest.TestCase):
         flat_never = [k for ks in r.meta["never_owned"]["tracks"].values() for k in ks]
         self.assertIn("tx:s", flat_never)
         self.assertIn("tx:s", canon_keys(sp, A.client_id))      # 仍在
-        self.assertNotIn("tx:s", sp.tombstones)                 # 不写墓碑
 
     # ---- M1-b：歌单级。B 新建歌单，A 的 stale 段没有它。
     #      第十三轮（2026-10-08 真机：lx 加的歌单在栖弦里删掉却同步不上去）拍板 D32：
@@ -155,14 +155,11 @@ class MultiDeviceEngineTest(unittest.TestCase):
         r = sp.merge(A.client_id, sub([("tx", "t1")], nid="p1", name="P1"))
         self.assertIn(p2, r.meta["removed_playlists"])
         self.assertEqual(r.meta["never_owned"]["playlists"], [])
-        self.assertIn(p2, sp.tombstones)                             # 写歌单墓碑
         self.assertNotIn(p2, canon_playlists(sp, B.client_id))       # 别端视图里也没了
-        self.assertNotIn("tx:t2", sp.tombstones)                     # D28：不派生曲目墓碑
 
     # ---- D32 配套：栖弦删掉的歌单，原创建者（洛雪，本地还留着）回推时不得复活 ----
     def test_d32_deleted_playlist_stays_deleted_against_creator_readd(self):
         sp = self._space()
-        sp.restore_grace_seconds = 3600      # 同步循环几秒一轮：远未越过冷静期
         A = self._dev(sp, "d-a")             # 栖弦：在本地删掉那张歌单
         L = self._lx(sp, "d-l")              # 洛雪：歌单的创建者，本地副本还带着它
         L2 = {
@@ -179,16 +176,11 @@ class MultiDeviceEngineTest(unittest.TestCase):
         self.assertIn(p2, A.base_served.view)
         r = sp.merge(A.client_id, sub([("tx", "t1")], nid="p1", name="P1"))
         self.assertIn(p2, r.meta["removed_playlists"])  # D32：交付过 + 可信 ⇒ 判删
-        self.assertIn(p2, sp.tombstones)
         self.assertNotIn(p2, canon_playlists(sp, L.client_id))
 
-        # 洛雪本地还留着这张歌单 → 回推：冷静期内被墓碑压制，不复活
+        # D34：洛雪本地还留着这张歌单 → 回推即恢复（无墓碑压制、无冷静期）
         r2 = sp.merge(L.client_id, L2)
-        self.assertIn(p2, r2.meta["suppressed_playlists"])
-        self.assertNotIn(p2, canon_playlists(sp, A.client_id))
-        self.assertIn(p2, sp.tombstones)
-        # 洛雪这次提交里带着它 ⇒ 不算"看过即采纳"：计入 carried，墓碑不 GC（D21 后半句 + 第十二轮）
-        self.assertIn(L.client_id, sp.tombstones[p2].carried)
+        self.assertIn(p2, canon_playlists(sp, A.client_id))
 
     # ---- M1-c：A 确实删掉自己加过的歌 ⇒ 照常删除（R1 不削弱 D22） ----
     def test_m1c_real_delete_still_works(self):
@@ -201,12 +193,11 @@ class MultiDeviceEngineTest(unittest.TestCase):
         sp.merge(A.client_id, sub([("tx", "t1"), ("tx", "t2")]))
         sp.deliver(A.client_id)
 
-        # A 删 t2：owned(A) = base_served ∩ base_submitted 含 t2 ⇒ 照常删除
-        r = sp.merge(A.client_id, sub([("tx", "t1")]))
+        # A 删 t2：trusted 客户端段 modified_at 变化 ⇒ 照常删除
+        r = sp.merge(A.client_id, sub([("tx", "t1")], modified_at="2026-10-09T12:00:00Z"))
         removed = {k for v in r.meta["removed_tracks"].values() for k in v}
         self.assertIn("tx:t2", removed)
         self.assertNotIn("tx:t2", canon_keys(sp, A.client_id))
-        self.assertIn("tx:t2", sp.tombstones)
 
     # ---- 第十一轮（2026-10-08 用户真机）：洛雪拉下来的歌，在洛雪里删掉却同步不上去 ----
     #      用户原话（m04646）：先在栖弦往 Yes 加一首 → lx 拉下来（正常）→ 在 lx 删掉 →
@@ -240,7 +231,6 @@ class MultiDeviceEngineTest(unittest.TestCase):
         r = sp.merge(L.client_id, sub([("tx", "t1")]))
         removed = {k for v in r.meta["removed_tracks"].values() for k in v}
         self.assertIn("kw:k9", removed)                     # 放松后判删
-        self.assertIn("kw:k9", sp.tombstones)
         self.assertNotIn("kw:k9", canon_keys(sp, A.client_id))   # 别端视图也没了
         # 歌单级同样成立（整份替换 ⇒ 缺席的歌单就是删掉的歌单）
         self.assertNotIn("kw:k9", {k for e in r.meta["never_owned"]["tracks"].values()
@@ -275,11 +265,11 @@ class MultiDeviceEngineTest(unittest.TestCase):
         r = sp.merge(L.client_id, sub([("tx", "t1")]))
         self.assertEqual(r.meta["removed_tracks"], {})
         self.assertIn("zz:z1", {k for v in r.meta["never_owned"]["tracks"].values() for k in v})
-        self.assertNotIn("zz:z1", sp.tombstones)
         self.assertIn("zz:z1", canon_keys(sp, A.client_id))
 
     def test_lx_relaxation_still_gated_by_concurrency(self):
-        """I2′：交付之后别端又写过 ⇒ 只记 suspects，不判删（旧视图不判删）。"""
+        """D34：I2′ 闸门已移除。L 是 full_view trusted，kw 在 round_trip_sources 内，
+        交付过 kw:k9 ⇒ 缺席即删（即便别端并发写过，也无并发门拦截）。"""
         sp = self._space()
         A = self._dev(sp, "d-a", "cyshine-v1")
         L = self._lx(sp, "d-l")
@@ -290,11 +280,9 @@ class MultiDeviceEngineTest(unittest.TestCase):
         sp.merge(A.client_id, sub([("tx", "t1"), ("kw", "k9"), ("wy", "w1")]))  # 并发写
 
         r = sp.merge(L.client_id, sub([("tx", "t1")]))
-        self.assertEqual(r.meta["removed_tracks"], {})
-        self.assertIn("kw:k9", r.meta["suspects"].get(
-            next(pid for pid, pl in sp.playlists.items() if pl.name == "P"), []))
-        self.assertNotIn("kw:k9", sp.tombstones)
-        self.assertIn("kw:k9", canon_keys(sp, L.client_id))
+        removed = {k for v in r.meta["removed_tracks"].values() for k in v}
+        self.assertIn("kw:k9", removed)                              # D34：无 I2′ 闸门，直接删
+        self.assertNotIn("kw:k9", canon_keys(sp, L.client_id))
 
     # ---- M2：一台设备确认删除、另一台未采纳 ⇒ 墓碑不被提前 GC（删除不推回） ----
     def test_m2_tombstone_not_gced_before_other_device_sees_it(self):
@@ -305,18 +293,17 @@ class MultiDeviceEngineTest(unittest.TestCase):
         sp.merge(B.client_id, sub([("tx", "t1")]))
         sp.deliver(A.client_id)   # A 完成一轮 GET（真实同步流程）
 
-        # A 删自己提交过的 t1（R1 照常判删）
-        sp.merge(A.client_id, sub([]))
-        self.assertIn("tx:t1", sp.tombstones)
+        # A 删自己提交过的 t1（trusted + 段 modified_at 变化 ⇒ 判删）
+        sp.merge(A.client_id, sub([], modified_at="2026-10-09T12:00:00Z"))
+        self.assertNotIn("tx:t1", canon_keys(sp, A.client_id))
 
-        # A 自己 GET：仅推进交付基线；B 尚未提交确认 ⇒ 墓碑必须还在
-        # （第三轮修复：GET 不代表应用删除，删除确认一律来自提交内容）
+        # A 自己 GET：删除结果保持（无人回推 ⇒ 不复活）
         sp.deliver(A.client_id)
-        self.assertIn("tx:t1", sp.tombstones)
+        self.assertNotIn("tx:t1", canon_keys(sp, A.client_id))
 
-        # B 提交确认应用该删除（提交视图不再携带 t1）⇒ 确认齐 ⇒ 墓碑才回收
+        # B 提交不含 t1 ⇒ 删除保持（无墓碑、无回推 ⇒ 不复活）
         sp.merge(B.client_id, sub([]))
-        self.assertNotIn("tx:t1", sp.tombstones)
+        self.assertNotIn("tx:t1", canon_keys(sp, B.client_id))
 
     # ---- M8：老空间 key 兼容。无标识请求沿用旧 key，带标识才新建独立 client ----
     def test_m8_legacy_client_key_compat(self):
@@ -369,14 +356,12 @@ class MultiDeviceEngineTest(unittest.TestCase):
         self.assertNotIn(p2, r.meta["removed_playlists"])
         self.assertEqual(r.meta["never_owned"]["playlists"], [])
         self.assertIn(p2, canon_playlists(sp, A.client_id))   # 仍存活
-        self.assertNotIn(p2, sp.tombstones)
         self.assertEqual(sp.revision, rev)                    # 无删除 ⇒ revision 不动
         # 澜音照常提交带 p2 → 正常保留（没有任何人删过它）
         r2 = sp.merge(CE.client_id, {"playlists": [
             {"native_id": "p1", "name": "栖弦单", "tracks": [{"source": "tx", "songId": "1"}]},
             {"native_id": "p2", "name": "澜音单", "tracks": [{"source": "wy", "songId": "7"}]}]})
         self.assertIn(p2, canon_playlists(sp, A.client_id))
-        self.assertFalse(r2.meta["suppressed_playlists"])
 
     # ---- P0.5 补充：I2′ 并发轮次的 never_owned 只并入 suspects、不出卡（防噪音） ----
     def test_never_owned_under_revision_gate_only_suspects(self):
@@ -390,12 +375,8 @@ class MultiDeviceEngineTest(unittest.TestCase):
         sp.deliver(A.client_id)                      # A.GET2 → 看到 y（base_served 含 y），served=rev2
         sp.merge(B.client_id, sub([("tx", "x"), ("wy", "y"), ("kw", "z")]))  # B 又加 z → rev3
         sp.deliver(B.client_id)
-        # A 拿旧视图回写（无 y,z）：I2′ 触发（rev3 != served2）；y/z ∉ owned(A) = never_owned
-        # → 只并入 suspects，不出卡
+        # A 拿旧视图回写（无 y,z）：trusted 段没 modified_at 变化 ⇒ M1 保护 ⇒ 不删
         r = sp.merge(A.client_id, sub([("tx", "x")]))
-        self.assertTrue(r.meta["suspects"])
-        flat = [k for ks in r.meta["suspects"].values() if isinstance(ks, list) for k in ks]
-        self.assertIn("wy:y", flat)
         self.assertIn("wy:y", canon_keys(sp, A.client_id))   # 不删
 
     # ---- 第四轮 P0-C：同空间成员互信，B 直接删除（无确认卡）后，A（曾提交者）
@@ -416,17 +397,14 @@ class MultiDeviceEngineTest(unittest.TestCase):
             {"native_id": "p1", "name": "歌单", "tracks": [{"source": "tx", "songId": "x"}]}]})
         sp.deliver(B.client_id)
         pl_id = next(k for k, v in sp.playlists.items() if v.name == "歌单")
-        # B 提交缺 p1（B 提交过它 = owned）⇒ 判删、写墓碑
+        # B 提交缺 p1（B 提交过它 = owned）⇒ D34：判删
         r = sp.merge(B.client_id, sub([("kw", "0")], nid="p2", name="其他"))
         self.assertIn(pl_id, r.meta["removed_playlists"])
-        self.assertIn(pl_id, sp.tombstones)           # 直接写墓碑（无卡，D33）
         # A GET 跨过删除点（base_served 推进到删除后 revision）
         sp.deliver(A.client_id)
-        # A 本地残留回推（提交视图仍带 p1+x）→ 第四轮 P0-C：看过删除结果 + 冷静期已过
-        # （测试 grace=0）→ 显式恢复，直接生效清墓碑
+        # A 本地残留回推（提交视图仍带 p1+x）→ D34：加回来就加回来（无墓碑压制）
         r2 = sp.merge(A.client_id, sub([("tx", "x")], nid="p1", name="歌单"))
         self.assertIn(pl_id, canon_playlists(sp, A.client_id))
-        self.assertNotIn(pl_id, sp.tombstones)
 
     # ---- 第四轮 P0-C：没看过删除结果的残留回推（stale 客户端）仍被压制 ----
     def test_stale_client_readd_still_suppressed(self):
@@ -440,12 +418,9 @@ class MultiDeviceEngineTest(unittest.TestCase):
         sp.deliver(A.client_id)                       # A GET2 → served=rev2（对齐，I2′ 放行）
         sp.merge(A.client_id, sub([], nid="p2", name="空"))  # A 删 p1（owned 直删）→ rev3
         pl_id = next(k for k, v in sp.playlists.items() if v.name == "歌单")
-        self.assertIn(pl_id, sp.tombstones)
-        # B 拿删除前的旧视图回推（从未看过删除结果）→ 压制、不复活
+        # D34：B 拿删除前的旧视图回推 → 加回来就加回来（无墓碑压制）
         rb = sp.merge(B.client_id, sub([("tx", "x")], nid="p1", name="歌单"))
-        self.assertIn(pl_id, rb.meta["suppressed_playlists"])
-        self.assertNotIn(pl_id, canon_playlists(sp, A.client_id))
-        self.assertIn(pl_id, sp.tombstones)
+        self.assertIn(pl_id, canon_playlists(sp, A.client_id))
 
     # ---- 第四轮 P0-A：交付 stamp 必须严格大于客户端刚提交的 modifiedAt ----
     def test_stamp_beats_submitted_modified_at(self):
@@ -463,28 +438,20 @@ class MultiDeviceEngineTest(unittest.TestCase):
         # 内容不变时 stamp 稳定（字节全同，幂等交付）
         self.assertEqual(st, sp.deliver(B.client_id).stamp)
 
-    # ---- 第四轮 P0-C：冷静期内重加（即使看过删除结果）仍按残留压制 ----
-    # 注意 P0-B：墓碑 GC = 全员看过删除视图。需一个从未看过的客户端钉住墓碑，
-    # 否则 A 看过即触发 GC、重加无墓碑可压（单设备"删了又加"本就等价于恢复）。
+    # ---- D34：删除后重加即恢复（无冷静期压制、无墓碑）----
     def test_grace_period_suppresses_immediate_readd(self):
         sp = self._space()
-        sp.restore_grace_seconds = 3600   # 冷静期 1 小时：age≈0 必触发压制
         A = self._dev(sp, "d-a")
         C = self._dev(sp, "d-c")
         sp.merge(A.client_id, sub([("tx", "1")]))
         sp.deliver(A.client_id)
-        sp.merge(C.client_id, sub([("tx", "1")]))   # C 也拥有 p1，之后不 GET → 未 ack → 墓碑保留
-        sp.merge(A.client_id, sub([]))              # A 删除（无歌单视图 → 曲目级缺席即删）
-        sp.deliver(A.client_id)                     # A 看过删除结果（C 未确认 → 不 GC）
-        r = sp.merge(A.client_id, sub([("tx", "1")]))  # 冷静期内重加 → 曲目被压制
-        self.assertIn("tx:1", r.meta["suppressed_tracks"])
-        self.assertNotIn("tx:1", canon_keys(sp, A.client_id))   # 曲目不复活
-        # 越过冷静期（把墓碑删除时间改老模拟时间流逝）→ 显式恢复直接生效
-        for t in sp.tombstones.values():
-            t.deleted_at = "2020-01-01T00:00:00.000Z"
-        sp.merge(A.client_id, sub([("tx", "1")]))
+        sp.merge(C.client_id, sub([("tx", "1")]))
+        # A 删除（trusted + 段 modified_at 变化 ⇒ 判删）
+        sp.merge(A.client_id, sub([], modified_at="2026-10-09T12:00:00Z"))
+        sp.deliver(A.client_id)
+        # D34：A 重加 → 立即恢复（无冷静期压制）
+        r = sp.merge(A.client_id, sub([("tx", "1")]))
         self.assertIn("tx:1", canon_keys(sp, A.client_id))
-        self.assertNotIn("tx:1", sp.tombstones)
 
     # ---- 第四轮 P1-3：澜音（can_delete=False）的"缺席"只记录、不写删除 ----
     def test_never_owned_not_deleted_when_can_delete_false(self):
@@ -505,7 +472,6 @@ class MultiDeviceEngineTest(unittest.TestCase):
         r = sp.merge(CE.client_id, {"playlists": [
             {"native_id": "p2", "name": "澜音单", "tracks": [{"source": "wy", "songId": "7"}]}]})
         self.assertIn(pl1, r.meta["never_owned"]["playlists"])
-        self.assertNotIn(pl1, sp.tombstones)
         self.assertIn(pl1, canon_playlists(sp, A.client_id))   # p1 仍存活
 
     # ---- 第四轮 P0-C：看过删除结果 + 越过冷静期的重加 = 显式恢复（无恢复卡） ----
@@ -517,12 +483,10 @@ class MultiDeviceEngineTest(unittest.TestCase):
         sp.deliver(A.client_id)
         sp.merge(B.client_id, sub([("tx", "1")]))
         sp.deliver(B.client_id)
-        sp.merge(A.client_id, sub([]))     # A 删除
-        sp.deliver(B.client_id)            # B 看过删除结果（grace=0 → 越冷静期）
-        r = sp.merge(B.client_id, sub([("tx", "1")]))  # B 重加 → 显式恢复
-        self.assertNotIn("tx:1", r.meta.get("suppressed_tracks", []))
+        sp.merge(A.client_id, sub([], modified_at="2026-10-09T12:00:00Z"))     # A 删除
+        sp.deliver(B.client_id)            # B 看过删除结果
+        r = sp.merge(B.client_id, sub([("tx", "1")]))  # D34：B 重加 → 立即恢复
         self.assertIn("tx:1", canon_keys(sp, B.client_id))
-        self.assertNotIn("tx:1", sp.tombstones)
 
     # ---- 第十二轮（2026-10-08 真机：洛雪删掉的歌在栖弦里删不掉，最后还被"显式恢复"复活）----
     # 现场序列（journal）：09:11:14 栖弦加歌并置顶 → 09:12:05 洛雪整份 PUT 删掉它（写墓碑）
@@ -533,11 +497,9 @@ class MultiDeviceEngineTest(unittest.TestCase):
     # （`_crossed_deletion_point`）⇒ 清墓碑 + 重新入列置顶 = 删除被撤销（真机 rev 21）。
     def test_stale_readd_after_remote_delete_does_not_revive(self):
         sp = self._space()
-        sp.restore_grace_seconds = 3600     # 同步循环几秒一轮：远未越过冷静期
         A = self._dev(sp, "d-a", "cyshine-v1")
         L = self._lx(sp, "d-l")
-        C = self._dev(sp, "d-c", "cyshine-v1")   # 第三台设备：本轮不 GET（钉住墓碑，
-        #                                          复刻真机空间里那些从不 ack 的幽灵客户端）
+        C = self._dev(sp, "d-c", "cyshine-v1")   # 第三台设备：本轮不 GET
 
         sp.merge(A.client_id, sub([("tx", "t1")]))          # 栖弦建歌单
         sp.merge(L.client_id, sub([("tx", "t1")]))          # 洛雪有基线（同一 native_id）
@@ -548,9 +510,8 @@ class MultiDeviceEngineTest(unittest.TestCase):
         sp.merge(A.client_id, sub([("tx", "t1"), ("tx", "k9")]),
                  client_modified_at="2030-01-01T00:00:00.000Z")
         sp.deliver(L.client_id)                             # 洛雪拉到这首歌
-        r = sp.merge(L.client_id, sub([("tx", "t1")]))      # 洛雪删掉它 → 写墓碑
+        r = sp.merge(L.client_id, sub([("tx", "t1")]))      # 洛雪删掉它
         self.assertIn("tx:k9", {k for v in r.meta["removed_tracks"].values() for k in v})
-        self.assertIn("tx:k9", sp.tombstones)
 
         # 修复 A：这次 GET 的视图与它上次拿到的一模一样（都不含 k9），但它手上那份
         # （base_submitted）含 k9 ⇒ 交付戳必须推进、压过它自己声明的 modifiedAt，
@@ -560,47 +521,26 @@ class MultiDeviceEngineTest(unittest.TestCase):
         self.assertGreater(dr.stamp, "2030-01-01T00:00:00.000Z")
         self.assertGreater(dr.stamp, stale)
 
-        # 栖弦本地还没应用删除，拿旧视图回推 → 压制、不复活
+        # D34：A 回推 k9 → 加回来就加回来（无墓碑压制、无冷静期）
         r = sp.merge(A.client_id, sub([("tx", "t1"), ("tx", "k9")]))
-        self.assertIn("tx:k9", r.meta["suppressed_tracks"])
-        self.assertEqual(r.meta["added_tracks"], {})        # 被压制的键不算"新增"
-        self.assertNotIn("tx:k9", canon_keys(sp, A.client_id))
-        self.assertIn("tx:k9", sp.tombstones)
-
-        # 修复 B：它还在回推这个键（在 carried 里）⇒ 不算"看过即采纳"（D21 判据的后半句）
-        # ⇒ 它不能被记 ack，墓碑也就不可能因"全员确认"被 GC 收走。否则收走墓碑之后，
-        # 它下一次回推就成了**无墓碑的普通重加** = 已确认的删除被复活。
-        sp.deliver(A.client_id)
-        self.assertIn("tx:k9", sp.tombstones)
-        self.assertNotIn(A.client_id, sp.tombstones["tx:k9"].acked)
-
-        # 再回推一次：仍然压制，歌曲不复活、墓碑仍在
-        r = sp.merge(A.client_id, sub([("tx", "t1"), ("tx", "k9")]))
-        self.assertIn("tx:k9", r.meta["suppressed_tracks"])
-        self.assertNotIn("tx:k9", canon_keys(sp, A.client_id))
-        self.assertIn("tx:k9", sp.tombstones)
+        self.assertIn("tx:k9", canon_keys(sp, A.client_id))
 
     # ---- 第四轮 P1-2 / D33：untrusted（无删除能力）端点批量删除 → withheld ----
     def test_untrusted_bulk_delete_withheld(self):
         sp = self._space()
-        sp.restore_grace_seconds = 0
         L = sp.register_client("acct:ceru-plugin:default", dialect="ceru-plugin",
                                identity_verified=True, can_delete=False)
         sp.merge(L.client_id, {"playlists": [
             {"native_id": "p1", "name": "歌单",
              "tracks": [{"source": "tx", "songId": f"{i}"} for i in range(12)]}]})
         sp.deliver(L.client_id)
-        # 澜音"删 11 首"（它提交过这些曲目 → owned；但无删除能力 → 不可信）
+        # 澜音"删 11 首"：不可信客户端 owned = base_served ∩ base_submitted = 全部 12 首；
+        # 缺席 11 首 ⇒ D34：直接删除（无安全阀拦截）
         r = sp.merge(L.client_id, {"playlists": [
             {"native_id": "p1", "name": "歌单",
              "tracks": [{"source": "tx", "songId": "0"}]}]})
-        # D33：安全阀永不弹卡——不应用（条目保留、不写墓碑），只在
-        # meta.safety_valve.withheld 留痕。
-        self.assertTrue(r.meta["safety_valve"]["withheld"])
-        self.assertIsNone(r.meta["safety_valve"]["applied"])
-        self.assertEqual(len(sp.tombstones), 0)                # 未写墓碑
         # 注：sp.tracks 的键是内部 tr_… id，判"还剩几首活曲目"要用 Track.deleted_at
-        self.assertEqual(len([t for t in sp.tracks.values() if t.deleted_at is None]), 12)
+        self.assertEqual(len([t for t in sp.tracks.values() if t.deleted_at is None]), 1)
 
     # ---- 第九轮（2026-10-08 真机事故「lx 少传一张歌单，Yes 从 253 掉到 21」）----
     #      整份歌单消失（客户端不再提交它）只删**歌单本身**，不据此派生曲目级删除：
@@ -631,11 +571,7 @@ class MultiDeviceEngineTest(unittest.TestCase):
         self.assertIn(pl_mix, r.meta["removed_playlists"])
         self.assertNotIn(pl_mix, r.meta["removed_tracks"])     # 不派生曲目级删除
         self.assertNotIn(pl_mix, canon_playlists(sp, L.client_id))   # 歌单确实没了
-        # 曲目键一个都不进墓碑（真机事故被写掉的就是这 235 个曲目墓碑）；
-        # 歌单墓碑只在这一个客户端没有回推时会被 ack-GC，故不强制它留在 sp.tombstones 里。
-        for k in ["tx:s1", "tx:s2", "tx:s3", "wy:y1", "kg:m1"]:
-            self.assertNotIn(k, sp.tombstones)
-        self.assertTrue(all(t.element == "playlist" for t in sp.tombstones.values()))
+        # D34：曲目键一个都不被删除（歌单级删除不派生曲目级删除）
         keys = canon_keys(sp, L.client_id)
         for k in ["tx:s1", "tx:s2", "tx:s3", "wy:y1"]:
             self.assertIn(k, keys)                            # Yes 里的共享曲一首没少

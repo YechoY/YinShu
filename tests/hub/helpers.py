@@ -62,8 +62,16 @@ class HttpClient:
 def cyshine_payload(playlists: list, local_tracks: dict = None) -> dict:
     """栖弦 payload。playlists: [{id,name,tracks:[(src,sid,title)]}]
     local_tracks: {playlist_id: [原始 track 对象]} —— 本地/文件曲目（I6 opaque）。"""
+    # D34：每次调用生成不同 updatedAt（全局递增秒），模拟客户端真实编辑行为
+    global _cyshine_ts_counter
+    try:
+        _cyshine_ts_counter += 1
+    except NameError:
+        _cyshine_ts_counter = 1
+    from datetime import datetime, timezone, timedelta
+    _base = datetime(2026, 10, 5, tzinfo=timezone.utc)
     data = []
-    for pl in playlists:
+    for i, pl in enumerate(playlists):
         tracks = []
         for src, sid, title in pl["tracks"]:
             tracks.append({
@@ -77,9 +85,10 @@ def cyshine_payload(playlists: list, local_tracks: dict = None) -> dict:
             })
         if local_tracks and str(pl["id"]) in local_tracks:
             tracks.extend(local_tracks[str(pl["id"])])
+        ts = (_base + timedelta(seconds=_cyshine_ts_counter + i)).strftime("%Y-%m-%dT%H:%M:%SZ")
         data.append({"version": 1, "id": pl["id"], "name": pl["name"],
                      "tracks": tracks, "createdAt": "2026-10-05T00:00:00Z",
-                     "updatedAt": "2026-10-05T00:00:00Z"})
+                     "updatedAt": ts})
     return {"schemaVersion": 1, "generatedAt": "2026-10-05T00:00:00Z",
             "sections": {"playlists": {"data": data},
                          "appearance": {"data": {"themeSeedArgb": 4289230000}},

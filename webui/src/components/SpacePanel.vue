@@ -10,6 +10,7 @@ import {
   getMembers, setMemberRole, removeMember,
   createInvite, getInvites, revokeInvite, joinByCode,
   updateUserSpace, fetchUsersRaw, fmtTime, renameSpace, updatePolicy,
+  getSpaceBackups, restoreSpaceBackup,
 } from "../lib/api";
 
 const props = defineProps({
@@ -33,6 +34,7 @@ const okMsg = ref("");
 const busy = ref(false);
 const dialog = ref("");       // "" | "create" | "join" | "role" | "remove-member"
                               //    | "revoke" | "add-member" | "leave" | "del-space"
+                              //    | "restore"
 /* 表单 */
 const newName = ref("");
 const joinCode = ref("");
@@ -48,6 +50,9 @@ const spaceTarget = ref(null);
 const revokeTarget = ref(null);
 const addTarget = ref("");
 const addRole = ref("editor");
+/* 备份与恢复：槽位列表 + 待恢复目标 */
+const backups = ref([]);
+const restoreTarget = ref(null);   // {slot, ...摘要}
 
 const ROLE_LABEL = { owner: "管理员", editor: "可编辑", viewer: "只读" };
 const roleLabel = (r) => ROLE_LABEL[r] || r || "";
@@ -120,10 +125,48 @@ async function loadManage() {
     if (seq !== manageSeq) return;
     members.value = mm.members || [];
     invites.value = ii.invites || [];
+    /* 备份槽位仅 owner/admin 可见；非 owner 403 时静默忽略 */
+    getSpaceBackups(props.token, props.manageSpace)
+      .then((r) => { if (seq === manageSeq) backups.value = r.slots || []; })
+      .catch(() => { if (seq === manageSeq) backups.value = []; });
   } catch (e) {
     if (seq !== manageSeq) return;
     err.value = e.message;
   }
+}
+
+/* ---- 备份与恢复 ---- */
+function fmtSize(n) {
+  if (n == null) return "–";
+  if (n < 1024) return n + " B";
+  if (n < 1024 * 1024) return (n / 1024).toFixed(1) + " KB";
+  return (n / 1024 / 1024).toFixed(2) + " MB";
+}
+const slotLabel = { current: "当前数据", bak1: "备份 1（上一次）", bak2: "备份 2（更早）" };
+function askRestore(slotInfo) {
+  if (!slotInfo || !slotInfo.exists || slotInfo.slot === "current") return;
+  if (slotInfo.error) return;
+  restoreTarget.value = slotInfo;
+  err.value = ""; okMsg.value = "";
+  dialog.value = "restore";
+}
+async function confirmRestore() {
+  const t = restoreTarget.value;
+  if (!t) return;
+  if (busy.value) return;
+  busy.value = true;
+  try {
+    await restoreSpaceBackup(props.token, props.manageSpace, t.slot);
+    closeDialog();
+    flash(t.slot === "bak1"
+      ? "已恢复到上一次状态（恢复前的数据现在在备份 1，再恢复一次即可撤销）"
+      : "已恢复到更早的备份（恢复前的数据保存在备份 1）");
+    /* 刷新备份列表与成员/邀请码（恢复后基线已重置，revision 等会变） */
+    const r = await getSpaceBackups(props.token, props.manageSpace).catch(() => null);
+    if (r) backups.value = r.slots || [];
+    loadManage();
+    emit("changed");
+  } catch (e) { err.value = e.message; } finally { busy.value = false; }
 }
 
 function openDialog(name) {
@@ -162,8 +205,8 @@ function pickManage(sp) {
 watch(
   () => props.manageSpace,
   (nv) => {
-    if (!nv) { members.value = []; invites.value = []; return; }
-    members.value = []; invites.value = [];
+    if (!nv) { members.value = []; invites.value = []; backups.value = []; return; }
+    members.value = []; invites.value = []; backups.value = [];
     lastCreatedCode.value = "";
     err.value = ""; okMsg.value = "";
     loadManage();
@@ -554,6 +597,34 @@ onMounted(() => { load(); loadManage(); });
         </div>
         <div v-else class="invite-empty">暂无有效的邀请码。生成一个发给家人/朋友，即可凭码加入。</div>
         </template>
+
+        <!-- 备份与恢复：owner/admin。每次同步落盘自动滚动两份备份；恢复 = 文件互换，可逆 -->
+        <template v-if="canManage(manageInfo)">
+        <div class="block-title backup-title">备份与恢复
+          <span class="backup-sub">每次同步自动保留最近 2 份备份 · 恢复可撤销</span>
+        </div>
+        <div class="backup-list">
+          <div v-for="b in backups" :key="b.slot" class="backup-row"
+               :class="{ cur: b.slot === 'current' }">
+            <div class="backup-main">
+              <span class="backup-slot">{{ slotLabel[b.slot] || b.slot }}</span>
+              <span v-if="b.exists" class="backup-meta">
+                {{ b.mtime ? b.mtime.replace("T", " ") : "" }} · {{ fmtSize(b.size) }} ·
+                歌单 {{ b.playlists ?? "–" }} 个 / 曲目 {{ b.tracks ?? "–" }} 首
+              </span>
+              <span v-else class="backup-meta">（空）</span>
+            </div>
+            <div v-if="b.exists && b.names && b.names.length" class="backup-names"
+                 :title="b.names.join('、')">{{ b.names.join("、") }}</div>
+            <div class="backup-ops">
+              <button v-if="b.slot !== 'current'" class="btn-ghost mini" :disabled="busy || !b.exists || !!b.error"
+                :title="b.error || ('把空间数据恢复到' + (slotLabel[b.slot] || b.slot))"
+                @click="askRestore(b)">恢复到此</button>
+              <span v-else class="backup-cur-tag">使用中</span>
+            </div>
+          </div>
+        </div>
+        </template>
       </template>
     </div>
     <div v-if="!manageBlockSpaces.length" class="empty-line">你还没有加入任何空间；在「我的空间」新建或凭邀请码加入一个后，即可在这里查看成员。</div>
@@ -801,6 +872,31 @@ onMounted(() => { load(); loadManage(); });
       </div>
     </div>
   </div>
+
+  <!-- 恢复备份：文件互换可逆；恢复后各端下次同步只增不删 -->
+  <div v-if="dialog === 'restore'" class="modal-mask" @click.self="closeDialog">
+    <div class="modal glass">
+      <div class="modal-head">
+        <strong>恢复备份：{{ spLabel({ space: manageSpace, name: manageInfo?.name }) }}</strong>
+        <button class="modal-x" @click="closeDialog">×</button>
+      </div>
+      <div v-if="err" class="modal-msg err">{{ err }}</div>
+      <div class="modal-hint">
+        将把空间数据恢复到 <strong>{{ slotLabel[restoreTarget?.slot] }}</strong>：
+        <template v-if="restoreTarget">
+          {{ restoreTarget.mtime?.replace("T", " ") }} · 歌单 {{ restoreTarget.playlists }} 个 / 曲目 {{ restoreTarget.tracks }} 首
+          <template v-if="restoreTarget.names?.length">（{{ restoreTarget.names.join("、") }}）</template>
+        </template>
+        。<br>
+        当前数据不会丢失——它会被换到备份 1 槽位，<strong>再恢复一次即可撤销</strong>。
+        恢复后各设备下次同步只增不删，请各端拉取一次确认后再正常同步。
+      </div>
+      <div class="form-ops">
+        <button class="btn-primary danger-solid" :disabled="busy" @click="confirmRestore">{{ busy ? "恢复中…" : "确认恢复" }}</button>
+        <button class="btn-ghost form-btn" @click="closeDialog">取消</button>
+      </div>
+    </div>
+  </div>
 </template>
 
 <style scoped>
@@ -942,6 +1038,20 @@ onMounted(() => { load(); loadManage(); });
 .invite-empty { font-size: 12.5px; color: var(--ink-3); margin-top: 6px;
   padding: 14px 16px; border: 1px dashed rgba(74, 111, 165, .28); border-radius: 10px;
   background: rgba(255, 255, 255, .35); letter-spacing: .01em; }
+/* ---- 备份与恢复 ---- */
+.backup-title { display: flex; align-items: baseline; gap: 8px; }
+.backup-sub { font-size: 11px; font-weight: 400; color: var(--ink-3); }
+.backup-list { display: flex; flex-direction: column; gap: 6px; }
+.backup-row { padding: 8px 10px; border: 1px solid rgba(74, 111, 165, .25); border-radius: 9px;
+  background: rgba(255, 255, 255, .45); font-size: 12.5px; }
+.backup-row.cur { border-color: rgba(85, 157, 143, .45); background: rgba(133, 205, 202, .12); }
+.backup-main { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+.backup-slot { font-weight: 700; color: var(--ink); }
+.backup-meta { color: var(--ink-3); font-size: 11.5px; }
+.backup-names { margin-top: 3px; color: var(--ink-2); font-size: 11.5px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.backup-ops { margin-top: 5px; display: flex; justify-content: flex-end; }
+.backup-cur-tag { font-size: 11.5px; color: #4f8879; }
 .btn-ghost.mini { width: auto; height: auto; padding: 3px 10px; font-size: 11.5px; border-radius: 6px; }
 .rp-sub { font-style: normal; font-size: 11px; font-weight: 400; color: var(--ink-3); margin-left: 6px; }
 /* 第三轮 §3.4：可编辑成员只见邀请码区时的提示 / 全局策略开关 / 重命名按钮 */
