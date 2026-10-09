@@ -68,16 +68,7 @@ DEFAULT_POLICY = {
     "max_owned_spaces": 3,        # 普通账号建空间配额（全局 admin 不限）
     "allow_self_register": True,  # 允许凭邀请码自助注册（公网部署前应关闭）
     "member_invite": False,       # 仅 owner/管理员可发邀请码；True 时 editor 也可
-    # 第四轮引擎策略（删除免二次确认，dsh §2.4）：
-    "trusted_direct_delete": True,    # P1-2：可信同空间客户端批量删除直接生效，不挂确认卡
-    # 第八轮（2026-10-08 用户拍板「不要再弹确认了」）：批量删除的安全阀**永不挂起**，
-    # 两条分支（都写进 meta["safety_valve"]）：
-    #   可信端（identity_verified ∧ can_delete ∧ ¬retired）
-    #     → applied：直接生效、journal/meta 留痕；
-    #   不可信端 → withheld：**既不生效也不出卡**（它表达不了"我要批量删"的意图）。
-    # D33（2026-10-08）：确认卡通道（confirm_delete/confirm_restore 开关、
-    # pending-* 端点与前端 PendingCard）整体移除，见 docs/09 D33。
-    "restore_grace_seconds": 120,     # P0-C：删除冷静期秒数（期内重加一律按残留压制）
+    # D34：墓碑/冷静期/安全阀全拆除——删除就是删除，加回来就是加回来
 }
 _SPACE_ROLES = ("owner", "editor", "viewer")
 _ROLE_RANK = {"viewer": 1, "editor": 2, "owner": 3}
@@ -142,16 +133,12 @@ def _apply_engine_policy_to(eng) -> None:
     """把全局 policy 里的引擎策略套到**单个**引擎上（第八轮）。"""
     if eng is None:
         return
-    # D33：确认卡开关已移除，policy 只剩 trusted_direct_delete / restore_grace_seconds
-    eng.trusted_direct_delete = bool(_policy.get("trusted_direct_delete", True))
-    eng.restore_grace_seconds = _policy.get("restore_grace_seconds")
+    # D34：墓碑/冷静期全拆除
+    pass
 
 
 def _apply_engine_policy() -> None:
-    """把 policy 里的引擎策略（第四轮 §2.4）应用到已加载的所有空间引擎。
-    新加载的空间由 _repair_engine_fields 兜底默认值（trusted_direct_delete=True、
-    restore_grace_seconds=None→类常量），并在 Hub.get/probe 时通过 policy_hook
-    立刻套用（第八轮：按需加载的空间也要吃到 policy）。"""
+    """把 policy 里的引擎策略应用到已加载的所有空间引擎（D34 后无引擎策略，保留入口）。"""
     if _hub is None:
         return
     for rt in _hub._runtimes.values():
@@ -206,14 +193,21 @@ def _ensure_v3() -> bool:
 
 
 def _atomic_write_json(path: str, obj) -> None:
-    """原子写 JSON（tmp + fsync + os.replace），并滚动 .bak1/.bak2。"""
+    """原子写 JSON（tmp + fsync + os.replace），并滚动 .bak1/.bak2。
+
+    备份统一收进配置文件同级的 backups/ 目录（不散落在根目录）；
+    backups/ 已在 .gitignore 中（config 快照含密码哈希，不入库）。"""
     import shutil as _shutil
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(obj, f, ensure_ascii=False, indent=2)
         f.flush()
         os.fsync(f.fileno())
-    bak1, bak2 = f"{path}.bak1", f"{path}.bak2"
+    _bak_dir = os.path.join(os.path.dirname(os.path.abspath(path)), "backups")
+    os.makedirs(_bak_dir, exist_ok=True)
+    _base = os.path.basename(path)
+    bak1 = os.path.join(_bak_dir, f"{_base}.bak1")
+    bak2 = os.path.join(_bak_dir, f"{_base}.bak2")
     if os.path.exists(bak1):
         _shutil.copyfile(bak1, bak2)
     if os.path.exists(path):
@@ -458,6 +452,15 @@ def _invite_status(inv: dict) -> Optional[str]:
     return None
 
 
+def _prune_invites() -> None:
+    """删除所有过期、用完、已撤销的邀请码。每次持久化前调用。"""
+    dead = [code for code, inv in _invites.items() if _invite_status(inv) is not None]
+    for code in dead:
+        _invites.pop(code, None)
+    if dead:
+        _log(f"清理过期邀请码 {len(dead)} 个: {dead}")
+
+
 def _space_summary(space: str, viewer: str) -> dict:
     """GET /api/spaces 与 /api/me 共用的空间条目（不含歌单内容）。"""
     rt = _hub.probe(space) if _hub is not None else None
@@ -521,6 +524,8 @@ def _persist_config() -> None:
     }
     cfg["spaces"] = json.loads(json.dumps(_spaces, ensure_ascii=False))
     cfg["members"] = json.loads(json.dumps(_members, ensure_ascii=False))
+    # D34：自动清理过期/用完/撤销的邀请码，避免 config.json 越堆越多
+    _prune_invites()
     cfg["invites"] = json.loads(json.dumps(_invites, ensure_ascii=False))
     cfg["policy"] = dict(_policy)
     try:
@@ -692,7 +697,8 @@ def api_user_delete(name: str, authorization: str = Header(default=""),
             _log(f"账号管理: {user} 删除账号 {name}，并清理孤儿空间 {space}（?purge=true）")
         else:
             _audit("account.delete", user, space, f"删除账号 {name}，空间数据保留")
-            _log(f"账号管理: {user} 删除账号 {name}；空间 {space} 已无成员，数据保留在 data/spaces/")
+            _store_dir = getattr(_hub, "store_dir", "data/spaces") if _hub else "data/spaces"
+            _log(f"账号管理: {user} 删除账号 {name}；空间 {space} 已无成员，数据保留在 {_store_dir}/")
     else:
         _audit("account.delete", user, space, f"删除账号 {name}")
         _log(f"账号管理: {user} 删除账号 {name}")
@@ -755,6 +761,57 @@ def api_space_delete(name: str, authorization: str = Header(default="")) -> JSON
     _audit("space.delete", user, sp, "孤儿" if is_orphan else "owner 删除")
     _log(f"空间管理: {user} 删除空间 {sp}")
     return JSONResponse({"ok": True, "deleted": sp})
+
+
+@app.get("/api/spaces/{name}/backups")
+def api_space_backups(name: str, authorization: str = Header(default="")) -> JSONResponse:
+    """列出空间备份槽位（current/bak1/bak2）：空间 owner 或全局 admin。
+
+    前端「备份与恢复」块用；每个槽位带摘要（歌单数/曲目数/歌单名/时间/大小），
+    让用户在恢复前看清"会恢复成什么样"。"""
+    user = _auth_user(authorization)
+    if user is None:
+        return _unauthorized()
+    sp = _find_space(name)
+    if sp is None:
+        return JSONResponse({"error": f"空间 {name} 不存在"}, status_code=404)
+    deny = _require_role(user, sp, "owner")
+    if deny is not None:
+        return JSONResponse({"error": "仅空间管理员可查看备份"}, status_code=403)
+    if _hub is None:
+        return JSONResponse({"error": "存储未初始化"}, status_code=500)
+    return JSONResponse({"space": sp, "slots": _hub.list_backups(sp)})
+
+
+@app.post("/api/spaces/{name}/backups/{slot}/restore")
+def api_space_backup_restore(name: str, slot: str,
+                             authorization: str = Header(default="")) -> JSONResponse:
+    """从备份槽位恢复空间数据：空间 owner 或全局 admin。
+
+    恢复是文件互换（可逆：恢复 bak1 后原数据在 bak1 槽位，再恢复一次即撤销）；
+    恢复后自动清空所有 client 同步基线，各端下一次同步走只增不删。"""
+    user = _auth_user(authorization)
+    if user is None:
+        return _unauthorized()
+    sp = _find_space(name)
+    if sp is None:
+        return JSONResponse({"error": f"空间 {name} 不存在"}, status_code=404)
+    deny = _require_role(user, sp, "owner")
+    if deny is not None:
+        return JSONResponse({"error": "仅空间管理员可恢复备份"}, status_code=403)
+    if _hub is None:
+        return JSONResponse({"error": "存储未初始化"}, status_code=500)
+    if slot not in ("bak1", "bak2"):
+        return JSONResponse({"error": "只能从 bak1 或 bak2 恢复"}, status_code=400)
+    try:
+        result = _hub.restore_backup(sp, slot)
+    except FileNotFoundError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=404)
+    except Exception as exc:
+        return JSONResponse({"error": f"恢复失败: {exc}"}, status_code=500)
+    _audit("space.restore_backup", user, sp, f"从 {slot} 恢复（重置 {result['reset_clients']} 个 client 基线）")
+    _log(f"空间管理: {user} 从 {slot} 恢复空间 {sp}")
+    return JSONResponse({"ok": True, "space": sp, **result})
 
 
 @app.put("/api/spaces/{name}/rename")
@@ -880,6 +937,18 @@ async def api_user_space(name: str, request: Request,
     old_space = _users[name].get("space", name)
     _users[name]["space"] = new_space
     _users[name]["updated_at"] = _now_iso()
+    # 多账户共用歌单 §3：切空间后，清空目标空间里该账号所有 client 的同步基线。
+    # 让下一次 PUT 走 _adopt_initial（只增不删），避免客户端带着另一个空间的歌单回来时
+    # 引擎把"缺席"误判为删除。
+    if _hub is not None:
+        try:
+            rt = _hub._runtimes.get(new_space)
+            if rt is not None:
+                n = rt.reset_account_clients(name)
+                if n:
+                    _log(f"空间切换: 重置账号 {name} 在空间 {new_space} 的 {n} 个 client 基线")
+        except Exception as _e:
+            _log(f"空间切换: 重置 client 基线失败（不阻断）: {_e}")
     # 成员表：把账号加入目标空间（已是成员则不降级；空间无 owner 时由其补位）
     if name not in _members.setdefault(new_space, {}):
         role = "owner" if not _space_owners(new_space) else "editor"
@@ -948,7 +1017,7 @@ async def api_policy_update(request: Request,
     except Exception:
         return JSONResponse({"error": "body 必须是 JSON"}, status_code=400)
     allowed = {"member_invite": bool, "user_create_space": bool,
-               "allow_self_register": bool, "trusted_direct_delete": bool}
+               "allow_self_register": bool}
     changed = []
     for k, conv in allowed.items():
         if k in body:
@@ -960,13 +1029,6 @@ async def api_policy_update(request: Request,
             changed.append("max_owned_spaces")
         except (TypeError, ValueError):
             return JSONResponse({"error": "max_owned_spaces 必须是整数"}, status_code=400)
-    if "restore_grace_seconds" in body:
-        try:
-            v = float(body["restore_grace_seconds"])
-            _policy["restore_grace_seconds"] = max(0, min(86400, v))
-            changed.append("restore_grace_seconds")
-        except (TypeError, ValueError):
-            return JSONResponse({"error": "restore_grace_seconds 必须是数字"}, status_code=400)
     if not changed:
         return JSONResponse({"error": "没有可修改的策略字段"}, status_code=400)
     _apply_engine_policy()
@@ -1503,7 +1565,7 @@ async def api_playlists_reorder(request: Request, authorization: str = Header(de
 
 @app.delete("/api/playlists/{pl_id}")
 def api_playlist_delete(pl_id: str, authorization: str = Header(default="")) -> JSONResponse:
-    """删除歌单（当前账号空间）：写墓碑，所有客户端下次拉取时同步删除。"""
+    """删除歌单（当前账号空间）：从引擎移除，所有客户端下次拉取时同步删除。"""
     user = _auth_user(authorization)
     if user is None:
         return _unauthorized()
@@ -1552,7 +1614,7 @@ async def api_tracks_reorder(pl_id: str, request: Request, authorization: str = 
 
 @app.delete("/api/playlists/{pl_id}/tracks/{key:path}")
 def api_track_delete(pl_id: str, key: str, authorization: str = Header(default="")) -> JSONResponse:
-    """删除歌单内一首歌（全局删除）：写墓碑，从所有歌单摘除并同步传播。"""
+    """删除歌单内一首歌（全局删除）：从所有歌单摘除并同步传播。"""
     user = _auth_user(authorization)
     if user is None:
         return _unauthorized()
@@ -1670,6 +1732,30 @@ def api_state(authorization: str = Header(default="")) -> JSONResponse:
     audit_all = _audit_tail(10 ** 6)
     audit = [r for r in audit_all if not r.get("space") or r.get("space") == space][-30:]
 
+    # 平台占比统计（前端环形图用）
+    from collections import Counter
+    _src_counts: Counter = Counter()
+    for pl_obj in eng.playlists.values():
+        if pl_obj.deleted_at is not None:
+            continue
+        for tr_id in pl_obj.track_ids:
+            tr = eng.tracks.get(tr_id)
+            if tr is not None and tr.deleted_at is None:
+                _src_counts[tr.source] += 1
+    _SOURCE_NAME = {"tx": "QQ音乐", "wy": "网易云", "kw": "酷我", "kg": "酷狗",
+                    "mg": "咪咕", "zz": "知乎", "local": "本地"}
+    _SOURCE_CLASS = {"tx": "tx", "netease": "netease", "wy": "netease",
+                     "kw": "kuwo", "kg": "kugou", "mg": "migu"}
+    platform_stats = []
+    for _src, _cnt in sorted(_src_counts.items(), key=lambda x: -x[1]):
+        cls = _SOURCE_CLASS.get(_src, "other")
+        platform_stats.append({
+            "source": _src,
+            "name": _SOURCE_NAME.get(_src, _src.upper()),
+            "cls": cls,
+            "count": _cnt,
+        })
+
     return JSONResponse({
         "space": space,
         "name": _spaces.get(space, {}).get("name", space),
@@ -1690,6 +1776,7 @@ def api_state(authorization: str = Header(default="")) -> JSONResponse:
         "playlists": playlists,
         "clients": clients,
         "journal": journal_out,
+        "platform_stats": platform_stats,
         "meta_pool_size": len(rt.meta_pool),
     })
 
@@ -1972,15 +2059,9 @@ def _sync_put(dialect: str, authorization: str, body: bytes,
         parts.append(f"+曲目[{pl}]:{len(ks)}")
     for pl, ks in (m.get("removed_tracks") or {}).items():
         parts.append(f"-曲目[{pl}]:{len(ks)}")
-    if m.get("suspects"):
-        parts.append("候选删除(他端写入)")
     no = m.get("never_owned") or {}
     if no.get("playlists") or no.get("tracks"):
-        # 第七轮：never_owned（R1 保护掉的缺席）一律不判删——只有"自己提交过"的缺席才是
-        # 删除意图。这条日志只是排查线索（真机事故：「Yes」5 首被澜音设备一轮 PUT 带走）。
         parts.append("缺席仅记录(未拥有，不判删)")
-    if m.get("suppressed_playlists") or m.get("suppressed_tracks"):
-        parts.append("墓碑压制")
     if m.get("reordered"):
         parts.append("排序变化")
     changed = "变更" if m.get("mutated") else "无变更"
@@ -2045,7 +2126,27 @@ def webdav_head(path: str) -> Response:
     return Response(status_code=200)
 
 
-@app.api_route("/{path:path}", methods=["GET", "PUT", "POST", "DELETE"])
+def _propfind_fake(href: str) -> bytes:
+    """生成假 PROPFIND 207 响应——href 用实际请求路径，webdav npm 库的 exists() 会检查 href 匹配。"""
+    # 确保 href 以 / 开头且 URL 编码安全
+    if not href.startswith("/"):
+        href = "/" + href
+    return f"""<?xml version="1.0" encoding="utf-8"?>
+<d:multistatus xmlns:d="DAV:">
+  <d:response>
+    <d:href>{href}</d:href>
+    <d:propstat>
+      <d:prop>
+        <d:resourcetype><d:collection/></d:resourcetype>
+        <d:displayname>{href.rsplit("/", 1)[-1] or "root"}</d:displayname>
+      </d:prop>
+      <d:status>HTTP/1.1 200 OK</d:status>
+    </d:propstat>
+  </d:response>
+</d:multistatus>""".encode("utf-8")
+
+
+@app.api_route("/{path:path}", methods=["GET", "PUT", "POST", "DELETE", "PROPFIND", "MKCOL", "HEAD"])
 async def webdav_fallback(path: str, request: Request,
                           authorization: str = Header(default=""),
                           if_none_match: str = Header(default=""),
@@ -2054,7 +2155,20 @@ async def webdav_fallback(path: str, request: Request,
     basename 命中某方言 files 且该方言 file_fallback=True 且方法为 GET/PUT → 分派给该方言
     （设备段可选：path 以 /d/<设备>/ 开头时按设备段解析）。只对显式开启的方言生效；
     /api/*、/assets/*、/ 的既有行为不变（它们都有更具体的路由，到不了这里）。
+
+    第十一轮补：PROPFIND/MKCOL/HEAD 假响应——洛雪 ensureDirectoryExists 会先 exists()（PROPFIND）
+    再 createDirectory()（MKCOL），枢纽没有真实目录结构，故统一返回假成功，让目录探测跳过。
+    HEAD 走 PROPFIND 同路径（洛雪 testConnection 用 getDirectoryContents('/')）。
     """
+    if request.method in ("PROPFIND", "HEAD"):
+        # 任何路径的目录探测 → 207 Multi-Status 假响应，href 用实际路径
+        _log(f"PROPFIND 兜底：{path} → 207 fake directory")
+        return Response(content=_propfind_fake("/" + path), status_code=207,
+                        headers={"Content-Type": "application/xml; charset=utf-8", "DAV": "1"})
+    if request.method == "MKCOL":
+        # 创建目录 → 201 Created 假响应
+        _log(f"MKCOL 兜底：{path} → 201 fake created")
+        return Response(status_code=201, headers={"DAV": "1"})
     if request.method in ("GET", "PUT"):
         base = path.rsplit("/", 1)[-1]
         for _d in REGISTRY.values():

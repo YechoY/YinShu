@@ -22,6 +22,12 @@ _log = logging.getLogger("hub.store")
 SCHEMA_VERSION = 1
 
 
+def _mtime_iso(path: str) -> str:
+    """文件最后修改时间的本地时区 ISO 串（前端直接展示）。"""
+    from datetime import datetime
+    return datetime.fromtimestamp(os.path.getmtime(path)).isoformat(timespec="seconds")
+
+
 def _force_remove(path: str) -> bool:
     """可靠删除单个文件（多级兜底，2026-10-06 实测加固）。
 
@@ -130,6 +136,26 @@ class SpaceRuntime:
             self._clients[cid] = dialect
         return cid
 
+    # ---- 账号空间切换：重置客户端基线 ----
+    def reset_account_clients(self, account: str) -> int:
+        """账号刚切到这个空间 → 清空它所有 client 的同步基线。
+
+        目的：让下一次 PUT 走 _adopt_initial（只增不删），避免客户端带着
+        另一个空间的歌单回来时，引擎把"缺席"误判为删除。
+        返回被重置的 client 数量。
+        """
+        reset = 0
+        prefix = f"{account}:"
+        for cid, client in list(self.engine.clients.items()):
+            if cid.startswith(prefix):
+                client.base_served = None
+                client.base_submitted = None
+                client.opaque = {}
+                client.last_delivered_stamp = None
+                client.last_submitted_stamp = None
+                reset += 1
+        return reset
+
     # ---- 合并 ----
     def merge(self, client_id: str, dialect: str, submission: dict,
               meta_delta: Optional[Dict[str, dict]], now: Optional[str],
@@ -231,6 +257,83 @@ class Hub:
             except OSError:
                 pass
         return sorted(out)
+
+    # ---- 备份与恢复（前端「备份与恢复」块，2026-10-09） ----
+    def list_backups(self, space_id: str) -> list:
+        """列出空间的三个槽位：current / bak1 / bak2，各带摘要（歌单数/曲目数/歌单名）。
+
+        bak1 = 上一次 save 前的状态，bak2 = 再往前一次；滚动保留，不会越堆越多。"""
+        base = self._space_path(space_id)
+        slots = []
+        for slot in ("current", "bak1", "bak2"):
+            path = base if slot == "current" else f"{base}.{slot}"
+            if not os.path.exists(path):
+                slots.append({"slot": slot, "exists": False})
+                continue
+            info = {"slot": slot, "exists": True,
+                    "size": os.path.getsize(path),
+                    "mtime": _mtime_iso(path)}
+            # 读 pkl 摘要：只取 engine.playlists，给前端展示"恢复后会变成什么样"
+            try:
+                import pickle
+                with open(path, "rb") as f:
+                    blob = pickle.load(f)
+                eng = (blob.get("data") or {}).get("engine")
+                if eng is not None and hasattr(eng, "playlists"):
+                    live = [p for p in eng.playlists.values() if p.deleted_at is None]
+                    live.sort(key=lambda p: p.name or "")
+                    info["playlists"] = len(live)
+                    info["tracks"] = sum(len(p.track_ids) for p in live)
+                    info["names"] = [p.name for p in live][:8]
+                    info["revision"] = getattr(eng, "revision", 0)
+            except Exception as exc:
+                info["error"] = f"备份文件损坏或不可读: {exc}"
+            slots.append(info)
+        return slots
+
+    def restore_backup(self, space_id: str, slot: str) -> dict:
+        """从 bak1/bak2 恢复空间数据。
+
+        - 恢复 = 文件互换（current ↔ bak1；bak2 走三向滚动），**可逆**：恢复 bak1 后
+          再恢复一次 bak1 即撤销（原 current 已换到 bak1 槽位）。
+        - 恢复后清空所有 client 的同步基线 → 各端下一次 PUT 走 _adopt_initial
+          （只增不删），避免客户端本地还是恢复前状态时把刚恢复的数据判删。
+        - 返回 {"reset_clients": n}。"""
+        if slot not in ("bak1", "bak2"):
+            raise ValueError("slot 只能是 bak1 或 bak2")
+        base = self._space_path(space_id)
+        src = f"{base}.{slot}"
+        if not os.path.exists(src):
+            raise FileNotFoundError(f"备份 {slot} 不存在")
+        # 先把内存运行时踢掉，防止它随后 save() 用旧状态覆盖恢复结果
+        self._runtimes.pop(space_id, None)
+        if slot == "bak1":
+            # current ↔ bak1 直接互换（可逆）
+            tmp = base + ".swap"
+            os.replace(base, tmp)
+            os.replace(src, base)
+            os.replace(tmp, src)
+        else:
+            # bak2 → current；current → bak1；旧 bak1 → bak2（三向滚动，不丢任何一份）
+            old_bak1 = f"{base}.bak1"
+            tmp = base + ".swap"
+            if os.path.exists(old_bak1):
+                os.replace(old_bak1, tmp)
+            os.replace(base, old_bak1)
+            os.replace(src, base)
+            if os.path.exists(tmp):
+                os.replace(tmp, src)
+        # 重新加载并重置基线
+        rt = self._load(space_id)
+        reset = 0
+        if rt is not None:
+            for client in rt.engine.clients.values():
+                if client.base_served is not None or client.base_submitted is not None:
+                    reset += 1
+                client.base_served = None
+                client.base_submitted = None
+            self._runtimes[space_id] = rt
+        return {"reset_clients": reset}
 
     def save(self, space_id: str):
         """P0-4：原子落盘（tmp + fsync + os.replace）+ 滚动 .bak。"""
@@ -354,26 +457,16 @@ def _repair_engine_fields(engine) -> None:
         engine.order_changed_at = None
     if not hasattr(engine, "sort_tag"):
         engine.sort_tag = 0
-    # 第四轮引擎策略（P0-C/P1-2）：旧 pkl 补默认值。
-    # D33（2026-10-08）：确认卡通道整体移除——旧 pkl 里遗留的
-    # pending_deletions/pending_restores/confirm_restore(bool)/restore_cards_enabled/
-    # delete_cards_enabled 一律清掉（confirm_restore 曾经是实例 bool 会遮住同名方法，
-    # 第八轮历史坑；现在方法也没了，清掉纯防脏数据跟着序列化）。
+    # D34：墓碑/冷静期/确认卡全拆除——旧 pkl 遗留字段一律清掉
     for _legacy in ("pending_deletions", "pending_restores",
-                    "confirm_restore", "restore_cards_enabled", "delete_cards_enabled"):
+                    "confirm_restore", "restore_cards_enabled", "delete_cards_enabled",
+                    "tombstones", "trusted_direct_delete", "restore_grace_seconds"):
         engine.__dict__.pop(_legacy, None)
-    if not hasattr(engine, "trusted_direct_delete"):
-        engine.trusted_direct_delete = True
-    if not hasattr(engine, "restore_grace_seconds"):
-        engine.restore_grace_seconds = None
     for c in engine.clients.values():
         if not hasattr(c, "last_delivered_stamp"):
             c.last_delivered_stamp = None
         if not hasattr(c, "last_submitted_stamp"):
             c.last_submitted_stamp = None
-        # 第十一轮 R1 放松：旧 pkl 的客户端对象没有这两个字段——按方言能力表补。
-        # 必须查实例 __dict__（不能 hasattr）：dataclass 的类级默认值会让 hasattr 恒为真，
-        # 补不上就会一路用 False/None（与上面 confirm_restore 踩的是同一类坑）。
         if "full_view_submit" not in c.__dict__ or "round_trip_sources" not in c.__dict__:
             caps = adapters.CAPABILITIES.get(c.dialect, {})
             c.full_view_submit = bool(caps.get("full_view_submit", False))
@@ -384,10 +477,6 @@ def _repair_engine_fields(engine) -> None:
                 c.base_served.stamp = ""
             if not hasattr(c.base_served, "opaque_hash"):
                 c.base_served.opaque_hash = None
-    # P0-B：旧 Tombstone 补 carried 集合（旧 pkl 无此字段）
-    for t in engine.tombstones.values():
-        if not hasattr(t, "carried"):
-            t.carried = set()
 
 
 def _repair_opaque_fields(rt) -> None:

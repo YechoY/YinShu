@@ -244,6 +244,24 @@ export async function renameSpace(token, name, newName) {
   return parseOrThrow(r);
 }
 
+/* 空间备份槽位列表（owner/管理员）：current/bak1/bak2 各带摘要 */
+export async function getSpaceBackups(token, name) {
+  const r = await fetch("/api/spaces/" + encodeURIComponent(name) + "/backups", {
+    headers: { Authorization: "Basic " + token },
+  });
+  return parseOrThrow(r);
+}
+
+/* 从备份槽位恢复空间数据（owner/管理员）：文件互换可逆，恢复后各端下次同步只增不删 */
+export async function restoreSpaceBackup(token, name, slot) {
+  const r = await fetch("/api/spaces/" + encodeURIComponent(name) +
+    "/backups/" + encodeURIComponent(slot) + "/restore", {
+    method: "POST",
+    headers: { Authorization: "Basic " + token },
+  });
+  return parseOrThrow(r);
+}
+
 /* 修改全局策略（仅管理员）：如 { member_invite: true } */
 export async function updatePolicy(token, patch) {
   const r = await fetch("/api/policy", {

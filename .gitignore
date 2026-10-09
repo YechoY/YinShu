@@ -11,9 +11,6 @@ node_modules/
 # 测试临时目录（本机 gettempdir 异常，测试空间统一放这）
 tmp/
 
-# 前端构建产物
-webui/dist/
-
 # 插件构建产物
 plugins/ceru-webdav-sync/dist/
 plugins/ceru-webdav-sync/release/plugin.js
