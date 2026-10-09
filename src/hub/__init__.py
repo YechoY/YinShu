@@ -1,4 +1,4 @@
-"""hub：同步合并枢纽（playlist-sync-hub）。
+"""hub：同步合并枢纽（音枢 Yinshu）。
 
 复用 engine/ 的合并引擎，包成 HTTP 端点：
   - Basic 认证，每账号一个同步空间
