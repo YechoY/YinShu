@@ -33,11 +33,11 @@
       "platforms": { "tx": { "songId": "003pgMEF0B7mWV", "playable": true } },
       "addedAt": "…", "updatedAt": "…", "deletedAt": null, "ext": {} }
   ],
-  "tombstones": [], "ext": {}
+  "ext": {}
 }
 ```
 
-一句话记住六件事：**身份只有一对**（`source`+`songId`）、**一首歌可挂多平台**、**品质归一但保留原生码**、**删除是墓碑不是缺席**、**不认识的字段进 `ext` 且必须带回去**、**同一首歌只存一份**。
+一句话记住六件事：**身份只有一对**（`source`+`songId`）、**一首歌可挂多平台**、**品质归一但保留原生码**、**删除 = 段 updatedAt 变了 + 缺席**（服务端以 `deletedAt` 记录，物理不删）、**不认识的字段进 `ext` 且必须带回去**、**同一首歌只存一份**。
 
 完整示例见 [`examples/canonical-v1.example.json`](examples/canonical-v1.example.json)，机器可校验的 Schema 见 [`canonical-v1.schema.json`](canonical-v1.schema.json)。
 
@@ -72,7 +72,6 @@
 | `generatedAt` | string(ISO8601) | **必须** | 文档生成时间，UTC |
 | `playlists` | `Playlist[]` | **必须** | 可以空数组；顺序即用户可见顺序 |
 | `tracks` | `Track[]` | **必须** | 曲目池；可以空数组；顺序无业务语义 |
-| `tombstones` | `Tombstone[]` | 可以 | 省略时视为 `[]`（服务端持久化用，渲染给客户端时可省略，见 `A5`） |
 | `ext` | object | 可以 | 未定义字段的容器，见 §8 |
 
 `S-T1`：顶层 **禁止**出现本表以外的字段——所有扩展 **必须**放进 `ext`。
@@ -91,7 +90,7 @@
 | `coverUrl` | string \| null | 可以 | ≤ 2048 字符 |
 | `createdAt` | string(ISO8601) | **必须** | UTC |
 | `updatedAt` | string(ISO8601) | **必须** | UTC |
-| `deletedAt` | string(ISO8601) \| null | 可以 | 非空 = 墓碑（`T2`） |
+| `deletedAt` | string(ISO8601) \| null | 可以 | 非空 = 已删（服务端内部标记，物理不删；**不是**客户端提交字段） |
 | `trackIds` | string[] | **必须** | **有序**；元素在 `tracks[]` 中 **必须**存在；**禁止**重复 |
 | `platforms` | object | 可以 | `{ "<平台code>": { "nativeId": string, "nativeName": string, "ext": object } }` |
 | `ownerRef` | object | 可以 | 来源歌单：`{ "source": "wy", "id": "2829…", "name": "…", "creator": "…" }` |
@@ -114,7 +113,7 @@
 | 平台 | `platforms` | object | 可以 | `{ "<平台code>": PlatformRef }`，见 4.3；**一首歌可以有多个** |
 | 状态 | `addedAt` | string(ISO8601) | **必须** | UTC |
 | 状态 | `updatedAt` | string(ISO8601) | **必须** | UTC |
-| 状态 | `deletedAt` | string(ISO8601) \| null | 可以 | 非空 = 墓碑 |
+| 状态 | `deletedAt` | string(ISO8601) \| null | 可以 | 非空 = 已删（服务端内部标记，物理不删；**不是**客户端提交字段） |
 | 状态 | `availability` | object | 可以 | 见 4.5；**不参与**合并判定 |
 | 扩展 | `ext` | object | 可以 | — |
 
@@ -149,19 +148,9 @@
 | `reason` | string \| null | 可以 | 人类可读原因 |
 | `checkedAt` | string(ISO8601) \| null | 可以 | 上次探测时间 |
 
-`A-AVAIL`：`availability` 与 `platforms.*.playable` **仅用于展示与提示**，**禁止**用作删除判定依据（判定只看身份与墓碑）。
+`A-AVAIL`：`availability` 与 `platforms.*.playable` **仅用于展示与提示**，**禁止**用作删除判定依据（判定只看"段 updatedAt 是否变化"与"是否缺席"）。
 
-### 4.6 `Tombstone`
-
-| 字段 | 类型 | 必填 | 说明 |
-|---|---|---|---|
-| `element` | `"track"` \| `"playlist"` | **必须** | — |
-| `id` | string | **必须** | 被删元素的规范 id |
-| `deletedAt` | string(ISO8601) | **必须** | UTC |
-| `device` | string | 可以 | 发起删除的客户端标识 |
-| `reason` | string | 可以 | `"user"` / `"merge"` 等 |
-
-### 4.7 `ext`（扩展容器）
+### 4.6 `ext`（扩展容器）
 
 一个 JSON 对象。键 **应当**用命名空间（`"<平台code>.<字段>"` 或反向域名），值 **必须**可 JSON 序列化，整块 **应当** < 64 KiB。
 
@@ -215,7 +204,7 @@ master > atmos_plus > atmos > hires > flac24bit > flac > 320k > 192k > 128k
 |---|---|
 | `I1` | 曲目身份 = `identity.source` + `identity.songId`；身份键字符串为 `<source>:<songId>`。 |
 | `I2` | `identity.songId` **必须**是平台裸 id：**禁止**带 `<source>_` 前缀、**禁止**带 `ceru-song:` 之类的包装。渲染到客户端时才拼装（如栖弦要求 `musicId = "<source>_<songId>"`）。 |
-| `I3` | `tracks[]` 内身份键 **必须**唯一；重复即非法文档。**注意**：唯一性约束作用在 `tracks[]` 上——**多个歌单的 `trackIds` 引用同一条曲目记录是合法的**（`P5` 的"只存一份"正是指这一点）。跨音源同名 id **必须**视为两首歌（`wy:1234567` ≠ `kw:1234567`）。**禁止**用歌名+歌手作为身份。**墓碑键**：曲目用 `(source, songId)` 的规范化字符串、歌单用歌单 `id`；同一元素出现多条墓碑时按"最晚一条"处理，不产生多份墓碑（评审 E4）。 |
+| `I3` | `tracks[]` 内身份键 **必须**唯一；重复即非法文档。**注意**：唯一性约束作用在 `tracks[]` 上——**多个歌单的 `trackIds` 引用同一条曲目记录是合法的**（`P5` 的"只存一份"正是指这一点）。跨音源同名 id **必须**视为两首歌（`wy:1234567` ≠ `kw:1234567`）。**禁止**用歌名+歌手作为身份。删除的记录以 `deletedAt` 标记（`T2`），**没有**独立的墓碑对象列表。 |
 | `I4` | 歌单身份 = 规范 `id`；跨端配对 **必须**通过 `platforms.<code>.nativeId` 映射表（服务端持久化）。名字 **仅**用于首次配对。 |
 | `I5` | 身份字段赋值后 **禁止**变更：改歌名、换封面、改归属歌单都不得改变 `id` / `identity`。 |
 | `I6` | 本地音乐/文件曲目（无平台 id）**禁止**作为一等元素进入规范文档（它们无法被跨端寻址，见 §9）。**但必须原样携带**：适配器把它们放进 `ext.<client>.opaque.tracks`（不参与合并判定、不参与去重、**不参与跨设备交付**——按 `client_key` 分桶存储与渲染，2026-10-06 D23）、不参与 `trackIds`），渲染时**原样回填**。`ext.*.opaque` **必须计入 `view_hash`**（否则"内容未变"会被误判为"已变"，导致无谓写回），但**不参与**身份键与冲突判定（评审 E5；分桶后各客户端哈希互不影响，语义上不再需要"排除 opaque"，口径见 D23）。理由：客户端（如栖弦 `applyFromSync`）对"缺席"按删除处理，若渲染时丢掉这些曲目，用户的本地音乐会被服务端**间接删除**。 |
@@ -227,10 +216,10 @@ master > atmos_plus > atmos > hires > flac24bit > flac > 320k > 192k > 128k
 | 编号 | 规则 |
 |---|---|
 | `T1` | 所有时间 **必须**是 ISO8601 UTC（`Z` 结尾），秒级或毫秒级。读取端 **应当**接受任意时区偏移并归一为 UTC。 |
-| `T2` | 删除 **必须**用 `deletedAt` 墓碑表达，**禁止**用"缺席"表达，**禁止**物理删除记录。 |
-| `T3` | 墓碑的保留**不以时间为判据**（D21）：只有在**删除发生时已注册的所有客户端都已在成功交付中见过它**（确认水位）之后才可以 GC；对**无删除能力的客户端（`can_delete=false`，如澜音插件）**"交付即确认"不成立——它删不掉本地副本，必须以其**提交内容里不再携带该条目**为确认（否则墓碑会被它的下一次 GET 提前回收，删除被推回，复检 S11/S15）；>180 天未出现的身份标记为 `retired` 并排除在 GC 条件之外。若运营上仍需一个兜底上界，其语义是"**完全没有确认时的最长保留**"，取**无限（永不按时间 GC）**；**绝不设短 TTL**（30 天与"离线 90 天/6 个月"用例直接冲突）。 |
-| `T4` | 对**未知元素**的墓碑 **也必须**保留——否则一个长期离线的旧客户端回来时会把已删元素复活。 |
-| `T5` | 顺序（`playlists[]` 顺序、`trackIds[]` 顺序）**不参与**合并判定：本阶段不做顺序同步（见 `docs/01` §1.5）。渲染时按规范的稳定顺序输出；客户端的顺序变化**不视为**一端变更，**也不得进入 `view_hash`**（否则两侧顺序差异会导致 ping-pong 写回，评审 E3）。 |
+| `T2` | **删除由服务端合并引擎判定**（D34）：客户端提交里**缺席** + 对应段 `updatedAt` **已变化** ⇒ 判定为删除；段未变时缺席**不**判删（M1 保护：客户端尚未采纳远端内容）。服务端以 `Track/Playlist.deletedAt` 做内部标记（**物理不删**），渲染给客户端时输出为删除后的状态。`deletedAt` **不是**客户端提交字段——客户端**不需要、也不应该**提交它。 |
+| `T3` | **无墓碑对象、无确认水位、无 GC**（D34）：删除即生效，**加回来就是加回来**（客户端重新提交该元素 ⇒ 恢复，无"墓碑压制/复活保护"）。 |
+| `T4` | 未知元素的删除同理：引擎按缺席 + 段变化判定，未知结构由 `ext`/opaque 原样携带（`I6`），服务端不维护独立删除记录。 |
+| `T5` | 顺序（`playlists[]` 顺序、`trackIds[]` 顺序）**不参与**合并判定：本阶段不做顺序同步（见根 `README` 架构原理）。渲染时按规范的稳定顺序输出；客户端的顺序变化**不视为**一端变更，**也不得进入 `view_hash`**（否则两侧顺序差异会导致 ping-pong 写回，评审 E3）。 |
 | `T6` | 各端墙上时钟**不可信**：合并判定 **禁止**直接比较两端的本地时间戳来决定胜负（同步服务用"每客户端基线差分"，见服务规范）。时间戳只用于展示与冲突记录。 |
 
 ---
@@ -336,7 +325,7 @@ master > atmos_plus > atmos > hires > flac24bit > flac > 320k > 192k > 128k
 
 ## 14. 完整示例
 
-见 [`examples/canonical-v1.example.json`](examples/canonical-v1.example.json)：含 2 个歌单、4 首曲目（其中 1 首同时在 `tx` 与 `wy` 可用、1 首 `unavailable`、1 首带未知品质码）、1 条墓碑、以及命名空间化的 `ext`。
+见 [`examples/canonical-v1.example.json`](examples/canonical-v1.example.json)：含 2 个歌单、4 首曲目（其中 1 首同时在 `tx` 与 `wy` 可用、1 首 `unavailable`、1 首带未知品质码）、2 条已删记录（`deletedAt` 非空）、以及命名空间化的 `ext`。
 
 校验：
 
@@ -351,6 +340,7 @@ python spec\validate-canonical-v1.py spec\examples\canonical-v1.example.json
 | 版本 | 日期 | 变更 |
 |---|---|---|
 | 1 | 2026-10-05 | 初稿。确定：曲目身份 `(source, songId)`、多平台引用 `platforms`、品质归一 + 原生码保留、`preferredQuality` 偏好、`availability` 提示（不参与判定）、墓碑删除语义、`ext` 前向兼容机制、适配器契约与 `cyshine-v1` 渲染硬要求；补充 §13 性能与规模（`PF1`–`PF8`）。 |
+| 1.1 | 2026-10-09 | **删除语义对齐 D34 简化引擎**：删除 = 客户端缺席 + 段 `updatedAt` 变化（服务端判定）；`deletedAt` 改为服务端内部标记（物理不删），不再是客户端提交字段；移除独立 `tombstones` 数组 / `Tombstone` 对象 / 确认水位 GC（原 `T3`）与墓碑压制（原 `T4`）；加回来就是加回来。同步更新 `schema.json`、校验器、示例。 |
 
 ### 待定
 

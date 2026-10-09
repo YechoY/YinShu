@@ -6,7 +6,7 @@
 |---|---|
 | [`canonical-v1.md`](canonical-v1.md) | **主规范**：原则、字段表、代码表、身份规则、时间与删除语义、扩展机制、序列化与校验、兼容性、适配器契约、性能与规模 |
 | [`canonical-v1.schema.json`](canonical-v1.schema.json) | JSON Schema（draft 2020-12），机器可校验 |
-| [`examples/canonical-v1.example.json`](examples/canonical-v1.example.json) | 完整示例：多平台引用、未知品质码、不可用状态、墓碑、命名空间化 `ext` |
+| [`examples/canonical-v1.example.json`](examples/canonical-v1.example.json) | 完整示例：多平台引用、未知品质码、不可用状态、已删记录、命名空间化 `ext` |
 | [`validate-canonical-v1.py`](validate-canonical-v1.py) | 校验器（仅标准库），实现规范里的 `V1`–`V12` |
 
 校验示例：
@@ -20,7 +20,7 @@ python spec\validate-canonical-v1.py spec\examples\canonical-v1.example.json
 1. **身份只有一对**：曲目 = `identity.source` + `identity.songId`（`tx` + 裸 id）；歌单 = 规范 `id` + 各端 `nativeId` 映射。
 2. **一首歌可挂多平台**：`platforms` 是 map，同一首歌在 QQ 和网易云都有就都留着。
 3. **品质归一但保留原生码**：`qualities[].code` 用统一码，`platforms.<p>.qualitys[].nativeCode` 存原文。
-4. **删除是墓碑不是缺席**：`deletedAt` 非空；墓碑的 GC 只看**确认水位**（删除发生时已注册的客户端都已在成功交付中见过它）**+ 身份退休（>180 天）**，**不设时间 TTL**（D20/D21）；**无删除能力的客户端（澜音）的"确认"必须来自提交内容**（它删不掉本地副本）；未知元素的墓碑也要留（防复活）。
+4. **删除 = 段 updatedAt 变了 + 缺席**（D34）：客户端提交里缺席、且对应段 `updatedAt` 已变化 ⇒ 服务端判删；段未变时缺席**不**判删（M1 保护）。服务端以 `deletedAt` 内部标记（物理不删），`deletedAt` **不是**客户端提交字段；**加回来就是加回来**——无墓碑对象、无确认水位、无墓碑压制（原 T3/T4 已移除）。
 5. **不认识的字段必须带回去**：进 `ext`，读取端禁止丢弃或报错。
 6. **同一首歌只存一份**：曲目在 `tracks[]` 池里，歌单只存有序 `trackIds` 引用（省体积、防膨胀）。**多个歌单引用同一条曲目记录是合法的**——唯一性约束只要求 `tracks[]` 内身份不重复（`I3`）。
 
@@ -48,8 +48,8 @@ python spec\validate-canonical-v1.py spec\examples\canonical-v1.example.json
 
 ## 相关文档
 
-- [`../docs/03-总体架构.md`](../docs/03-总体架构.md) — 服务端架构、WebDAV 门面、请求时序、多用户与配额
-- [`../docs/04-数据规范与适配器.md`](../docs/04-数据规范与适配器.md) — 适配器契约与逐客户端字段映射
-- [`../docs/05-合并引擎.md`](../docs/05-合并引擎.md) — 合并语义（`base_served` 差分、墓碑、安全阀）
-- [`../docs/10-评审记录与整改.md`](../docs/10-评审记录与整改.md) — 本规范的修订依据（哪些规则因评审而改）
-- [`../reference/设计说明书-v1.md`](../reference/设计说明书-v1.md) — 历史设计说明书（保留决策脉络，不再维护）
+- [`../README.md`](../README.md) — 项目主页：架构原理（D34 合并规则）、快速开始、常用命令
+- [`../12-空间与成员体系.md`](../12-空间与成员体系.md) — 空间 / 成员 / 角色 / 邀请码 / 配额
+- [`../13-接入新客户端.md`](../13-接入新客户端.md) — 适配器插件化：新增客户端只需加一个文件
+- [`../14-洛雪接入.md`](../14-洛雪接入.md) — `lx-x` 方言接入细节
+- [`docs/README.md`](README.md) — 本文档（spec 导览）

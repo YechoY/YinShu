@@ -141,24 +141,8 @@
       "ext": {}
     }
   ],
-  "tombstones": [
-    {
-      "element": "track",
-      "id": "tr_01J9Z8Q3K7W2M4X6B8C0D2E4H9",
-      "deletedAt": "2026-10-03T07:45:00Z",
-      "device": "phone-7f3a",
-      "reason": "user"
-    },
-    {
-      "element": "playlist",
-      "id": "pl_01J9Z8Q3K7W2M4X6B8C0D2E4H8",
-      "deletedAt": "2026-10-03T07:46:10Z",
-      "device": "phone-7f3a",
-      "reason": "user"
-    }
-  ],
   "ext": {
     "lx.playlistOrderHint": "local-first",
-    "spec.notes": "示例文档：含多平台引用、未知品质码、不可用状态、墓碑、命名空间化 ext。"
+    "spec.notes": "示例文档：含多平台引用、未知品质码、不可用状态、已删记录（deletedAt 非空）、命名空间化 ext。"
   }
 }

@@ -11,7 +11,6 @@
     "generatedAt": { "$ref": "#/$defs/timestamp" },
     "playlists": { "type": "array", "items": { "$ref": "#/$defs/playlist" } },
     "tracks": { "type": "array", "items": { "$ref": "#/$defs/track" } },
-    "tombstones": { "type": "array", "items": { "$ref": "#/$defs/tombstone" }, "default": [] },
     "ext": { "$ref": "#/$defs/ext" }
   },
   "$defs": {
@@ -159,18 +158,6 @@
         "updatedAt": { "$ref": "#/$defs/timestamp" },
         "deletedAt": { "anyOf": [{ "$ref": "#/$defs/timestamp" }, { "type": "null" }] },
         "ext": { "$ref": "#/$defs/ext" }
-      }
-    },
-    "tombstone": {
-      "type": "object",
-      "required": ["element", "id", "deletedAt"],
-      "additionalProperties": false,
-      "properties": {
-        "element": { "enum": ["track", "playlist"] },
-        "id": { "type": "string", "minLength": 1 },
-        "deletedAt": { "$ref": "#/$defs/timestamp" },
-        "device": { "type": ["string", "null"], "maxLength": 128 },
-        "reason": { "type": ["string", "null"], "maxLength": 128 }
       }
     }
   }
