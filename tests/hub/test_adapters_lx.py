@@ -238,6 +238,36 @@ class LxParseTest(unittest.TestCase):
         self.assertEqual([x["type"] for x in tm["qualitys"]], ["128k"])
         self.assertEqual(tm["_qualitys"], {"128k": {"size": ""}})
 
+    def test_05e_lists_always_present_for_overwrite_flow(self):
+        """回归（2026-10-10 真机）：洛雪"从云端数据覆盖本地"校验备份结构完整性，
+        defaultList/loveList 缺键即拒绝覆盖。opaque 没有三列表（新账号/新客户端
+        首次接入）时 render 必须输出空数组兜底；opaque 已有内容原样输出。
+        顶层 playHistory/downloadTasks 同样兜底空数组（上传结构里有这两键）。"""
+        # 无 lx_lists → defaultList/loveList/tempList 空数组，顶层 extras 空数组
+        out = render_lx(_ctx(view={"pl": {"name": "A", "tracks": []}},
+                             meta_pool={}, opaque={}, native_ids={}))
+        self.assertEqual(out["data"]["defaultList"], [])
+        self.assertEqual(out["data"]["loveList"], [])
+        self.assertEqual(out["data"]["tempList"], [])
+        self.assertEqual(out["playHistory"], [])
+        self.assertEqual(out["downloadTasks"], [])
+        self.assertEqual([p["name"] for p in out["data"]["userList"]], ["A"])
+        # opaque 有 lx_lists → 原样输出，不改写
+        out2 = render_lx(_ctx(
+            view={"pl": {"name": "A", "tracks": []}}, meta_pool={},
+            opaque={"lx_lists": {"defaultList": [{"id": "d1"}],
+                                 "loveList": [{"id": "l1"}],
+                                 "tempList": [{"id": "t1"}]}},
+            native_ids={}))
+        self.assertEqual(out2["data"]["defaultList"], [{"id": "d1"}])
+        self.assertEqual(out2["data"]["loveList"], [{"id": "l1"}])
+        self.assertEqual(out2["data"]["tempList"], [{"id": "t1"}])
+        # 已有顶层 extras 不被空数组覆盖
+        out3 = render_lx(_ctx(
+            view={"pl": {"name": "A", "tracks": []}}, meta_pool={},
+            opaque={"lx_extra": {"playHistory": [{"id": "h1"}]}}, native_ids={}))
+        self.assertEqual(out3["playHistory"], [{"id": "h1"}])
+
 
 class LxHttpTest(unittest.TestCase):
     """§2.9.5-6：WebDAV 路由 + 旁路 + 幂等（uvicorn 线程实测）。"""
