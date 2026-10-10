@@ -111,6 +111,7 @@ def _cyshine_track_identity(track) -> Optional[Tuple[str, str, dict]]:
     if not isinstance(src, str) or not src or not isinstance(song_id, str) or not song_id:
         return None   # 本地文件 / 无平台 id → I6 opaque 原样携带
 
+    raw = minfo.get("meta")
     show_meta = {
         "source": src,
         "title": track.get("name") or minfo.get("name"),
@@ -120,6 +121,9 @@ def _cyshine_track_identity(track) -> Optional[Tuple[str, str, dict]]:
         "pic_url": track.get("picUrl"),
         "music_info_id": minfo.get("id"),
         "duration_ms": _interval_to_duration_ms(minfo.get("interval")),
+        # 完整 meta 留档（音质明细/hash/albumId 等平台扩展字段），渲染时回填进
+        # musicInfo.meta——否则自家提交的数据经枢纽渲染回来也只剩裸 songId。
+        "raw_meta": dict(raw) if isinstance(raw, dict) and raw else None,
     }
     return str(src), str(song_id), show_meta
 
@@ -188,23 +192,69 @@ def _render_cyshine_track(key: str, meta_pool: Dict[str, dict]) -> dict:
     title = meta.get("title") or song_id
     singer = meta.get("singer") or ""
     music_id = f"{src}_{song_id}"
+    # 统一完整格式：musicInfo.meta 必须带封面/专辑/音质明细与平台扩展字段——
+    # 栖弦播放页从 music.meta.picUrl 取封面、meta.qualitys 取可切换音质，缺失即
+    # "列表页有封面（读顶层 picUrl）、进播放详情页封面和音质全没"（2026-10-10 真机）。
+    # 数据可能来自任意方言：优先栖弦自报的 raw_meta，其次洛雪留档的 lx_raw_meta。
+    # 注意：raw_meta 存在但只有 songId（栖弦对非本音源歌曲无法解析完整 meta）时，
+    # 不能 break 掉——必须继续合并 lx_raw_meta 的音质明细，否则播放页音质列表只剩
+    # 合成下限（2026-10-10 排查：栖弦在线 flac 播成 128k 的枢纽侧根因之一）。
+    music_meta: dict = {}
+    for raw_key in ("raw_meta", "lx_raw_meta"):
+        raw = meta.get(raw_key)
+        if isinstance(raw, dict) and raw:
+            for _k, _v in raw.items():
+                music_meta.setdefault(_k, _v)   # raw_meta 优先，lx_raw_meta 补缺
+    music_meta["songId"] = song_id                      # 规范身份覆盖陈旧值
+    music_meta["albumName"] = meta.get("album") or music_meta.get("albumName") or ""
+    music_meta["picUrl"] = meta.get("pic_url") or music_meta.get("picUrl") or ""
+    # 平台原生数字 id（源脚本取 URL 用）：未知就不写——写 <source>_<id> 前缀串
+    # 反而让脚本拿着垃圾 id 去请求（脚本会自动回退 songId）
+    native_id = meta.get("music_info_id") or meta.get("lx_num_id")
+    if native_id in (None, "", 0, "0"):
+        music_meta.pop("id", None)
+    else:
+        music_meta["id"] = native_id
+    _ensure_qualitys_array(music_meta, meta.get("quality"))
     return {
         "musicId": music_id,                                # 硬要求 3：<source>_<songId>
         "name": title,
         "singer": singer,
-        "albumName": meta.get("album") or "",
+        "albumName": music_meta["albumName"],
         "source": src,
         "quality": meta.get("quality") or "",
-        "picUrl": meta.get("pic_url") or "",
+        "picUrl": music_meta["picUrl"],
         "musicInfo": {
             "id": meta.get("music_info_id") or music_id,
             "name": title,
             "singer": singer,
             "source": src,
             "interval": _duration_ms_to_interval(meta.get("duration_ms")),  # 硬要求 4
-            "meta": {"songId": song_id},                    # 硬要求 3：裸 id
+            "meta": music_meta,
         },
     }
+
+
+def _ensure_qualitys_array(music_meta: dict, fallback_quality=None) -> None:
+    """保证 meta.qualitys 是非空数组（播放页音质切换直接解引用它）。
+
+    有 qualitys/_qualitys 明细就保真；只有枢纽已知最高档时合成 [最高档, 128k 下限]。
+    音质代码与栖弦 Quality 枚举同域（master/hires/flac/320k/128k...），未知代码客户端自行丢弃。
+    """
+    qs = music_meta.get("qualitys")
+    if isinstance(qs, list) and qs:
+        return
+    qm = music_meta.get("_qualitys")
+    if isinstance(qm, dict) and qm:
+        music_meta["qualitys"] = [
+            {"type": t, "size": v.get("size")}
+            if isinstance(v, dict) and v.get("size") is not None else {"type": t}
+            for t, v in qm.items() if t is not None
+        ]
+        return
+    q = fallback_quality if fallback_quality else "128k"
+    music_meta["qualitys"] = ([{"type": q}] +
+                              ([{"type": "128k"}] if str(q) != "128k" else []))
 
 
 def _render(ctx: RenderContext) -> dict:

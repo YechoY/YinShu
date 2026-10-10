@@ -28,6 +28,42 @@ def _mtime_iso(path: str) -> str:
     return datetime.fromtimestamp(os.path.getmtime(path)).isoformat(timespec="seconds")
 
 
+# 客户端原样留档快照字段：每次提交都是"当前完整状态"，不是增量。
+# 通用"缺失字段不覆盖已有值"（P4）会让首次提交的残缺明细（如洛雪 _qualitys
+# 只有 [master,128k]）永久赖在池子里——用户重新搜索出完整档位后重新提交也
+# 无法刷新（2026-10-10 真机：洛雪全局 flac 却播 128k；栖弦在线 flac 播 128k 同源）。
+_SNAPSHOT_FIELDS = ("lx_raw_meta", "raw_meta")
+
+
+def _snapshot_richer(new: dict, old: dict) -> bool:
+    """快照字段"更完整才整体替换"。
+
+    比较音质明细（_qualitys/qualitys）键集：新快照的明细键是旧的非空超集才替换。
+    - 残缺 → 完整（如 {master,128k} → {128k,320k,flac,master}）→ 替换，问题解除；
+    - 完整 → 等值/更残缺 → 不替换（保护已有数据，不违背 P4 精神）；
+    - 新快照无明细 → 不替换（无信息，避免覆盖）。
+    """
+    def _qkeys(m):
+        if not isinstance(m, dict):
+            return set()
+        out = set()
+        for f in ("_qualitys", "qualitys"):
+            v = m.get(f)
+            if isinstance(v, dict):
+                out |= set(v.keys())
+            elif isinstance(v, list):
+                out |= {x.get("type") for x in v
+                        if isinstance(x, dict) and x.get("type")}
+        return out
+
+    nk, ok = _qkeys(new), _qkeys(old)
+    if not nk:
+        return False
+    if not ok:
+        return True
+    return nk > ok
+
+
 def _force_remove(path: str) -> bool:
     """可靠删除单个文件（多级兜底，2026-10-06 实测加固）。
 
@@ -159,11 +195,17 @@ class SpaceRuntime:
               meta_delta: Optional[Dict[str, dict]], now: Optional[str],
               client_modified_at: Optional[str] = None) -> dict:
         # 元数据合并（缺失字段不覆盖已存在的，P4 保留）
+        # 例外：客户端原样快照字段（lx_raw_meta/raw_meta）"更完整才整体替换"，
+        # 防首次残缺提交赖住后续完整提交（_snapshot_richer，见上）。
         if meta_delta:
             for key, meta in meta_delta.items():
                 cur = self.meta_pool.setdefault(key, {})
                 for k, v in meta.items():
-                    if v is not None and k not in cur:
+                    if v is None:
+                        continue
+                    if k not in cur:
+                        cur[k] = v
+                    elif k in _SNAPSHOT_FIELDS and _snapshot_richer(v, cur[k]):
                         cur[k] = v
         # P0-A：客户端提交声明的 modifiedAt 透传给引擎（交付时间戳须压过它）
         return self.engine.merge(client_id, submission, now,

@@ -22,8 +22,12 @@ from engine.engine import SyncSpace
 from hub import adapters
 from hub import api
 from hub.adapters import REGISTRY
+from hub.store import Hub
 
-from tests.hub.helpers import HttpClient, cyshine_payload, ceru_payload
+from tests.hub.helpers import (HttpClient, cyshine_payload, ceru_payload,
+                               rmtree_force)
+
+_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 _ADAPTER_FILES = {"sync-v1.json"}   # 当前全部方言的 files（§2 洛雪加入后由注册表自检保证不重复）
 
@@ -255,6 +259,159 @@ class RegressionHttpTest(unittest.TestCase):
         st9, _, _ = self.c.get("/CyShineMusic/sync-v1.json",
                                extra_headers={"X-Hub-Device": "x/y"})
         self.assertEqual(st9, 400)
+
+
+class CyshineRenderMetaTest(unittest.TestCase):
+    """回归（2026-10-10 真机）：洛雪提交 → 栖弦渲染，musicInfo.meta 必须是完整元数据。
+
+    栖弦列表页读曲目顶层 picUrl（一直正常），播放详情页读
+    music.meta.picUrl（封面）与 meta.qualitys（可切换音质）——meta 只回填
+    {songId} 时表现为"列表页有封面、进播放页封面和音质全没"。
+    """
+
+    def test_lx_origin_track_renders_full_music_meta(self):
+        from hub.adapters.cyshine import render_cyshine
+        from hub.adapters.lx import parse_lx
+        payload = {"version": "2", "lastModified": 1700000000000, "data": {
+            "userList": [{"id": "1", "name": "Rock", "list": [{
+                "id": "wy_25906124", "name": "歌A", "singer": "歌手A",
+                "source": "wy", "interval": "03:27",
+                "meta": {"id": 25906124, "songId": 25906124,
+                         "albumName": "专辑A", "picUrl": "http://pic/a.jpg",
+                         "qualitys": [{"type": "flac", "size": "31MB"},
+                                      {"type": "128k", "size": "3MB"}],
+                         "_qualitys": {"flac": {"size": "31MB"},
+                                       "128k": {"size": "3MB"}},
+                         "strMediaMid": "002abc", "albumId": "123"},
+            }]}]}}
+        submission, meta_delta, _opaque, _w = parse_lx(payload)
+        from hub.adapters.base import identity_key
+        view = {"pl1": {"name": "Rock", "tracks": [
+            identity_key("wy", "25906124")]}}
+        out = render_cyshine(view, meta_delta, {"pl1": "1"}, None, 1,
+                             "2026-10-10T00:00:00Z")
+        track = out["sections"]["playlists"]["data"][0]["tracks"][0]
+        mm = track["musicInfo"]["meta"]
+        self.assertEqual(mm["songId"], "25906124")           # 规范身份
+        self.assertEqual(mm["picUrl"], "http://pic/a.jpg")   # 播放页封面
+        self.assertEqual(mm["albumName"], "专辑A")
+        self.assertEqual(mm["id"], 25906124)                 # 平台原生数字 id
+        self.assertTrue(mm["qualitys"])                      # 可切换音质非空
+        self.assertEqual(track["picUrl"], "http://pic/a.jpg")   # 列表页封面
+        self.assertEqual(track["musicId"], "wy_25906124")
+        self.assertEqual(track["source"], "wy")
+
+    def test_bare_pool_falls_back_to_quality_floor(self):
+        """池里无任何音质明细（如澜音提交）时合成 [已知最高档, 128k]，切换列表不空。"""
+        from hub.adapters.base import identity_key
+        from hub.adapters.cyshine import render_cyshine
+        key = identity_key("kw", "9")
+        view = {"pl": {"name": "N", "tracks": [key]}}
+        pool = {key: {"title": "歌B", "singer": "S", "album": "Al",
+                      "quality": "flac", "pic_url": "http://p/b.jpg"}}
+        out = render_cyshine(view, pool, {"pl": "pl"}, None, 1,
+                             "2026-10-10T00:00:00Z")
+        track = out["sections"]["playlists"]["data"][0]["tracks"][0]
+        mm = track["musicInfo"]["meta"]
+        self.assertEqual(mm["qualitys"], [{"type": "flac"}, {"type": "128k"}])
+        self.assertEqual(mm["picUrl"], "http://p/b.jpg")
+        self.assertEqual(mm["albumName"], "Al")
+        self.assertNotIn("id", mm)          # 无平台原生 id 就不写，让脚本回退 songId
+        self.assertEqual(track["musicInfo"]["meta"]["songId"], "9")
+
+    def test_qualitys_floor_128k_only_once(self):
+        """已知最高档就是 128k 时不重复垫下限。"""
+        from hub.adapters.cyshine import _ensure_qualitys_array
+        mm = {"songId": "1"}
+        _ensure_qualitys_array(mm, "128k")
+        self.assertEqual(mm["qualitys"], [{"type": "128k"}])
+        _ensure_qualitys_array(mm, None)
+        self.assertEqual(mm["qualitys"], [{"type": "128k"}])
+
+    def test_qualitys_uses_lx_raw_meta_when_raw_meta_bare(self):
+        """回归（2026-10-10 真机）：栖弦 raw_meta 只有 songId（非本音源歌曲无法解析
+        完整 meta）时，音质明细必须继续取 lx_raw_meta——否则播放页 qualitys 只剩合成
+        下限 [master,128k]，栖弦在线设 flac 也播 128k。"""
+        from hub.adapters.base import identity_key
+        from hub.adapters.cyshine import render_cyshine
+        key = identity_key("tx", "001iJcCp1q0kej")
+        view = {"pl": {"name": "N", "tracks": [key]}}
+        pool = {key: {
+            "title": "下完这场雨", "singer": "S", "album": "Al",
+            "quality": "master", "pic_url": "http://p/a.jpg",
+            "raw_meta": {"songId": "001iJcCp1q0kej"},   # 栖弦对洛雪源歌曲只解析出这个
+            "lx_raw_meta": {"songId": "001iJcCp1q0kej", "strMediaMid": "x",
+                            "_qualitys": {"master": {"size": ""},
+                                          "128k": {"size": ""}}},
+        }}
+        out = render_cyshine(view, pool, {"pl": "pl"}, None, 1,
+                             "2026-10-10T00:00:00Z")
+        mm = out["sections"]["playlists"]["data"][0]["tracks"][0]["musicInfo"]["meta"]
+        self.assertTrue(mm["qualitys"], "qualitys 必须非空")
+        types = [q["type"] for q in mm["qualitys"]]
+        self.assertIn("master", types)
+        self.assertIn("128k", types)
+        # 有明细时保真，不再走 fallback 合成路径——也不应凭空造 flac（拿不到 URL 更糟）
+        self.assertNotIn("flac", types)
+        self.assertEqual(mm["strMediaMid"], "x")   # lx_raw_meta 补充字段进入渲染
+
+
+class SnapshotMetaMergeTest(unittest.TestCase):
+    """第六轮（2026-10-10）：客户端原样快照字段（lx_raw_meta/raw_meta）
+    "更完整才整体替换"——首次残缺提交不得赖住后续完整提交。
+
+    背景：通用合并规则"缺失字段不覆盖已有值"（P4）对普通增量字段是对的；
+    但洛雪/栖弦每次提交 lx_raw_meta/raw_meta 都是"当前完整快照"，P4 会让
+    首次残缺 _qualitys（如 [master,128k]）永久赖住，用户重搜出 flac 后
+    重新提交也无法刷新 → 全局 flac 却播 128k（真机）。
+    """
+
+    def setUp(self):
+        self.store = tempfile.mkdtemp(prefix="snap_merge_",
+                                      dir=os.path.join(_ROOT, "tmp"))
+        self.hub = Hub(self.store)
+
+    def tearDown(self):
+        rmtree_force(self.store)
+
+    def _merge_meta(self, meta_delta):
+        rt = self.hub.get("main")
+        with rt.lock:
+            if "c" not in rt.engine.clients:
+                rt.engine.register_client("c", dialect="lx-x", identity_verified=True)
+            rt.merge("c", "lx-x",
+                     {"playlists": [], "opaque": None, "create_only": False},
+                     meta_delta, None)
+        return rt
+
+    def test_richer_lx_raw_meta_replaces_poor(self):
+        """残缺 [master,128k] → 完整 [128k,320k,flac,master]：整体替换。"""
+        key = "tx:001iJcCp1q0kej"
+        self._merge_meta({key: {"lx_raw_meta": {
+            "_qualitys": {"master": {"size": ""}, "128k": {"size": ""}}}}})
+        rt = self._merge_meta({key: {"lx_raw_meta": {
+            "_qualitys": {"128k": {"size": ""}, "320k": {"size": ""},
+                          "flac": {"size": ""}, "master": {"size": ""}}}}})
+        got = set(rt.meta_pool[key]["lx_raw_meta"]["_qualitys"])
+        self.assertEqual(got, {"128k", "320k", "flac", "master"})
+
+    def test_poor_lx_raw_meta_does_not_replace_richer(self):
+        """客户端数据回退（完整 → 残缺）不覆盖：保护已有数据。"""
+        key = "tx:x1"
+        self._merge_meta({key: {"lx_raw_meta": {
+            "_qualitys": {"128k": {}, "320k": {}, "flac": {}}}}})
+        rt = self._merge_meta({key: {"lx_raw_meta": {
+            "_qualitys": {"128k": {}}}}})
+        got = set(rt.meta_pool[key]["lx_raw_meta"]["_qualitys"])
+        self.assertEqual(got, {"128k", "320k", "flac"})
+
+    def test_ordinary_fields_still_p4_merge(self):
+        """非快照字段仍走 P4"缺失不覆盖"：title 已存在时新提交的 title 不覆盖。"""
+        key = "tx:x2"
+        rt = self._merge_meta({key: {"title": "旧名", "singer": "S1"}})
+        rt2 = self._merge_meta({key: {"title": "新名"}})
+        self.assertEqual(rt2.meta_pool[key]["title"], "旧名")
+        self.assertEqual(rt2.meta_pool[key]["singer"], "S1")
 
 
 if __name__ == "__main__":

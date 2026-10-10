@@ -306,11 +306,20 @@ def render_lx(ctx: RenderContext) -> dict:
         },
     }
     lists = (ctx.opaque.get("lx_lists") or {})
-    for _k in ("defaultList", "loveList", "tempList"):
-        if _k in lists:
-            payload["data"][_k] = lists[_k]
+    # 洛雪的覆盖/恢复流程校验备份结构完整性：defaultList/loveList 必须存在
+    # （老版本缺键即"备份中缺少歌单数据，已拒绝覆盖本地歌单"）。opaque 里没有
+    # （新账号/新客户端首次接入）时输出空数组兜底；tempList 一并输出（三列表齐全）。
+    # opaque 已有内容原样输出，不改写、不合并（I6 opaque 语义不变）。
+    payload["data"]["defaultList"] = lists.get("defaultList", [])
+    payload["data"]["loveList"] = lists.get("loveList", [])
+    payload["data"]["tempList"] = lists.get("tempList", [])
     for _k, _v in (ctx.opaque.get("lx_extra") or {}).items():
         payload[_k] = _v
+    # 顶层 playHistory/downloadTasks 兜底空数组：洛雪上传结构里有这两个键，
+    # 部分版本的恢复流程会按结构完整性校验，缺失同样可能被当成"备份不完整"。
+    for _k in ("playHistory", "downloadTasks"):
+        if _k not in payload:
+            payload[_k] = []
     return payload
 
 
