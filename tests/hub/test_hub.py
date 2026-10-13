@@ -184,6 +184,45 @@ class SmokeTest(unittest.TestCase):
         self.assertEqual(st, 404)
         self.assertEqual((body or {}).get("error"), "no baseline")
 
+    # ---- 加固：登录防爆破（同一 IP 窗口内连续失败达阈值 → 锁定 429）----
+    def test_bruteforce_lock_after_5_failures(self):
+        # 前面测试已产生失败记录（同一 127.0.0.1），先清空现场，测完再还原
+        api._fail_history.clear()
+        api._lock_until.clear()
+        try:
+            bad = HttpClient(self.base, "alice", "WRONG")
+            for i in range(4):
+                st, _, _ = bad.get("/api/state")
+                self.assertEqual(st, 401, f"第 {i + 1} 次失败应为 401")
+            # 第 5 次失败：达到阈值 → 锁定，返回 429（不再进路由）
+            st, headers, _ = bad.get("/api/state")
+            self.assertEqual(st, 429)
+            self.assertIn("Retry-After", headers)
+            # 锁定期内正确凭据同样被拒（429）
+            good = HttpClient(self.base, "alice", "pw1")
+            st, _, _ = good.get("/api/state")
+            self.assertEqual(st, 429)
+        finally:
+            api._fail_history.clear()
+            api._lock_until.clear()
+
+    # ---- 加固：大响应 gzip（>1024 字节压缩；对应 lx 的消息压缩）----
+    def test_gzip_large_sync_response(self):
+        c = HttpClient(self.base, "alice", "pw1")
+        tracks = [("tx", f"s{i}", f"歌曲{i}") for i in range(30)]
+        c.put("/CyShineMusic/sync-v1.json",
+              cyshine_payload([{"id": "g1", "name": "Gzip 歌单", "tracks": tracks}]))
+        c.get("/CyShineMusic/sync-v1.json")
+        st, headers, _ = c.get("/CyShineMusic/sync-v1.json",
+                               extra_headers={"Accept-Encoding": "gzip"})
+        self.assertEqual(st, 200)
+        self.assertEqual(headers.get("Content-Encoding"), "gzip")
+        # 小响应（401 的 JSON）不压缩
+        bad = HttpClient(self.base, "alice", "WRONG")
+        st2, headers2, _ = bad.get("/api/state")
+        self.assertEqual(st2, 401)
+        self.assertNotEqual(headers2.get("Content-Encoding"), "gzip")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

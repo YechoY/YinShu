@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import base64
+import collections
 import datetime
 import hashlib
 import hmac
@@ -38,6 +39,53 @@ _WEBUI = _ROOT / "webui"
 # _ROUTES/_PARSE/_RENDER 三表已删除；路由注册见文件尾部 _register_dialect_routes()。
 
 app = FastAPI(title="yinshu", docs_url=None, redoc_url=None, openapi_url=None)
+
+# ---- 加固一：响应 gzip（对应 lx 服务端的消息压缩；同步负载均为 JSON，压缩收益大）----
+from starlette.middleware.gzip import GZipMiddleware
+app.add_middleware(GZipMiddleware, minimum_size=1024)
+
+# ---- 加固二：登录防爆破（对应 lx 服务端的 IP 失败 10 次封禁）----
+# 同一客户端 IP 在窗口内连续认证失败达阈值 → 临时锁定，锁定期间直接 429（不进入路由）。
+# 只拦失败侧：正常凭据的请求不产生失败记录、不被拦截；成功登录自然停止产生失败，
+# 计数窗口滑动过期后自动恢复。改动仅限 HTTP 中间件层，不触碰任何认证路由。
+_AUTH_MAX_FAILS = 5
+_AUTH_FAIL_WINDOW_SECONDS = 300
+_AUTH_LOCK_SECONDS = 300
+_fail_history: Dict[str, collections.deque] = {}
+_lock_until: Dict[str, float] = {}
+
+
+def _auth_lock_response(remaining: float) -> JSONResponse:
+    return JSONResponse(
+        {"error": f"认证失败次数过多，已临时锁定 {int(remaining) + 1}s，请稍后再试"},
+        status_code=429,
+        headers={"Retry-After": str(int(remaining) + 1)})
+
+
+@app.middleware("http")
+async def _auth_bruteforce_guard(request: Request, call_next):
+    ip = request.client.host if request.client else "unknown"
+    now = time.time()
+    until = _lock_until.get(ip, 0.0)
+    if until > now:
+        return _auth_lock_response(until - now)
+    if until and until <= now:
+        _lock_until.pop(ip, None)
+    resp = await call_next(request)
+    if resp.status_code == 401:
+        # 只统计"带了 Basic 凭据但验证失败"的请求：攻击者必然带凭据猜密码；
+        # 无凭据的 401（浏览器首次打开、健康探测、客户端启动探测）不计入，避免误锁。
+        auth = request.headers.get("authorization") or ""
+        if auth.startswith("Basic "):
+            q = _fail_history.setdefault(ip, collections.deque())
+            q.append(now)
+            while q and now - q[0] > _AUTH_FAIL_WINDOW_SECONDS:
+                q.popleft()
+            if len(q) >= _AUTH_MAX_FAILS:
+                _lock_until[ip] = now + _AUTH_LOCK_SECONDS
+                _fail_history.pop(ip, None)
+                return _auth_lock_response(_AUTH_LOCK_SECONDS)
+    return resp
 # Vue 工程化构建产物（webui/dist/assets）
 # 注意：dist/ 是构建产物、被 .gitignore 忽略，全新克隆或未构建的部署里可能不存在。
 # StaticFiles(check_dir=True) 在 import 期就会抛 RuntimeError，那样连 "/" 上的友好提示

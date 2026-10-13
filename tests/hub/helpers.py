@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import base64
+import gzip
 import json
 import os
 import shutil
@@ -17,16 +18,26 @@ import urllib.error
 import urllib.request
 
 
+def _maybe_gunzip(headers, body: bytes) -> bytes:
+    """urllib 不自动解压 gzip 响应；GZip 中间件只压缩大响应，这里统一解压。"""
+    if (headers.get("Content-Encoding") or "").lower() == "gzip" and body:
+        try:
+            return gzip.decompress(body)
+        except Exception:
+            return body
+    return body
+
+
 def do_request(req):
     """发请求 → (status, headers, body)。非 2xx 也返回，不抛异常。
     timeout=30：本机 Windows IO（Defender/索引）间歇慢，10s 会误报超时。"""
     try:
         with urllib.request.urlopen(req, timeout=30) as r:
-            body = r.read()
+            body = _maybe_gunzip(r.headers, r.read())
             parsed = json.loads(body.decode("utf-8")) if body else None
             return r.status, r.headers, parsed
     except urllib.error.HTTPError as e:
-        body = e.read()
+        body = _maybe_gunzip(e.headers, e.read())
         try:
             return e.code, e.headers, json.loads(body.decode("utf-8")) if body else None
         except Exception:
