@@ -1,9 +1,12 @@
-"""合并引擎（简化版 D34）—— 删除就是删除，加回来就是加回来，各有增删就合并。
+"""合并引擎（简化版 D34 + 防复活）—— 删除就是删除，加回来就是加回来，各有增删就合并。
 
 唯一规则：
   - 段 updatedAt 变了 + 曲目缺席 = 删除
   - 段没变 + 曲目缺席 = 不动（栖弦整段覆盖客户端可能未采纳远端内容，M1 保护）
   - 在场的全部并集合并
+  - 防复活：已删条目的"残留回推"不复活——只有该端已被告知删除
+    （base_served 交付视图无此条目）后的再次提交，才算主动加回、允许恢复；
+    从未交付过（base_served 缺失）或交付视图仍含该条目的端，提交视为残留，保持删除。
 
 无墓碑、无冷静期、无 suspects、无安全阀、无 I2′ 闸门、无 R1 判据。
 """
@@ -365,7 +368,9 @@ class SyncSpace:
               client_modified_at: Optional[str] = None) -> MergeResult:
         """PUT 语义：解析 → 差分 → 合并 → 落库 → 渲染回该客户端。
 
-        唯一规则：段 updatedAt 变了 + 缺席 = 删；段没变 + 缺席 = 不动；在场的并集。
+        唯一规则：段 updatedAt 变了 + 缺席 = 删；段没变 + 缺席 = 不动；在场的并集；
+        已删条目的残留回推不复活（base_served 仍含它 = 未被告知删除；base_served
+        缺失 = 从未交付，同样保守视为残留）。
         """
         client = self.clients[client_id]
         now = now or self._now()
@@ -470,18 +475,35 @@ class SyncSpace:
         # ---- 事务（单写者） ----
         mutated = False
 
-        # 新增歌单（并集）
+        # 新增歌单（并集；已删歌单的残留回推不复活）
         added_playlists: Set[str] = set()
+        skipped_pl: List[str] = []
         for pl in sorted(added_pl := (cur_keys - base_keys)):
+            existing = self.playlists.get(pl)
+            if existing is not None and existing.deleted_at is not None:
+                if self._residual(client, pl_id=pl):
+                    skipped_pl.append(pl)
+                    continue
             if self._ensure_playlist(pl, view[pl]["name"], now):
                 mutated = True
                 added_playlists.add(pl)
 
-        # 新增曲目（并集 + 去重）
+        # 新增曲目（并集 + 去重；残留歌单整段跳过、残留曲目不复活）
         added_head: Dict[str, List[str]] = {}
         added_tracks: Dict[str, Set[str]] = {}
+        skipped_t: Dict[str, List[str]] = {}
         for pl in sorted(view.keys()):
+            pl_ = self.playlists.get(pl)
+            if pl_ is not None and pl_.deleted_at is not None:
+                if self._residual(client, pl_id=pl):
+                    skipped_t[pl] = sorted(view[pl]["tracks"])
+                    continue
             for key in view[pl]["tracks"]:
+                tr_old = self.tracks.get(self.identity_to_tr.get(key))
+                if tr_old is not None and tr_old.deleted_at is not None:
+                    if self._residual(client, key=key):
+                        skipped_t.setdefault(pl, []).append(key)
+                        continue
                 tr, ch = self._add_track(key, now)
                 inserted = self._append_to_playlist(pl, tr.tr_id, now)
                 if inserted or ch:
@@ -570,6 +592,10 @@ class SyncSpace:
                 "playlists": sorted(never_owned_pl),
                 "tracks": {pl: sorted(ks) for pl, ks in never_owned_t.items() if ks},
             },
+            "revival_skipped": {
+                "playlists": skipped_pl,
+                "tracks": {pl: sorted(set(ks)) for pl, ks in skipped_t.items() if ks},
+            },
         }
         self.journal.append({"client": client_id, "revision": self.revision,
                              "meta": meta, "at": now})
@@ -581,17 +607,33 @@ class SyncSpace:
     # ---- 首次接入 ---------------------------------------------------------
     def _adopt_initial(self, client: Client, view: Dict[str, dict], now: str,
                        before_pl: Set[str]) -> MergeResult:
-        """首次接入只增不删。"""
+        """首次接入只增不删；已删条目的残留（未被告知删除的端带来旧数据）不复活。"""
         mutated = False
         added_pl: Set[str] = set()
         added_t: Dict[str, List[str]] = {}
+        skipped_pl: List[str] = []
         for pl in sorted(view.keys()):
+            existing = self.playlists.get(pl)
+            if existing is not None and existing.deleted_at is not None:
+                if self._residual(client, pl_id=pl):
+                    skipped_pl.append(pl)
+                    continue
             if self._ensure_playlist(pl, view[pl]["name"], now):
                 mutated = True
                 added_pl.add(pl)
         added_head: Dict[str, List[str]] = {}
+        skipped_t: Dict[str, List[str]] = {}
         for pl in sorted(view.keys()):
+            pl_ = self.playlists.get(pl)
+            if pl_ is not None and pl_.deleted_at is not None:
+                if self._residual(client, pl_id=pl):
+                    continue
             for key in view[pl]["tracks"]:
+                tr_old = self.tracks.get(self.identity_to_tr.get(key))
+                if tr_old is not None and tr_old.deleted_at is not None:
+                    if self._residual(client, key=key):
+                        skipped_t.setdefault(pl, []).append(key)
+                        continue
                 tr, ch = self._add_track(key, now)
                 inserted = self._append_to_playlist(pl, tr.tr_id, now)
                 if inserted or ch:
@@ -646,7 +688,11 @@ class SyncSpace:
                 "added_tracks": {pl: sorted(set(ks)) for pl, ks in added_t.items() if ks},
                 "removed_playlists": [], "removed_tracks": {},
                 "revision": self.revision, "sort_tag": self.sort_tag,
-                "mutated": mutated, "reordered": reordered}
+                "mutated": mutated, "reordered": reordered,
+                "revival_skipped": {
+                    "playlists": skipped_pl,
+                    "tracks": {pl: sorted(set(ks)) for pl, ks in skipped_t.items() if ks},
+                }}
         self.journal.append({"client": client.client_id, "revision": self.revision,
                              "meta": meta, "at": now})
         view_out, cleanup = self.render_for(client)
@@ -655,6 +701,25 @@ class SyncSpace:
 
     # ---- 客户端生命周期 ---------------------------------------------------
     _RETIRED_AFTER_DAYS = 180
+
+    def _residual(self, client: Client, pl_id: Optional[str] = None,
+                  key: Optional[str] = None) -> bool:
+        """已删条目是否为该端"残留"（该端从未被告知删除）。
+
+        残留 = 该端交付视图（base_served）仍含该条目，或从未交付过（base_served 缺失）。
+        残留的再次提交只是本地旧数据回推，不是删除意图的反悔 → 不复活；
+        已被告知删除（交付视图无此条目）后的再次提交 = 主动加回 → 允许复活。
+        """
+        bsrv = client.base_served
+        if bsrv is None:
+            return True
+        view = bsrv.view
+        if pl_id is not None:
+            return pl_id in view
+        for e in view.values():
+            if key in e.get("tracks", ()):
+                return True
+        return False
 
     def _mark_retired(self, now: str) -> None:
         try:

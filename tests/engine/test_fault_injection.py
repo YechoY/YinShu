@@ -91,7 +91,7 @@ class TestFaultInjection(unittest.TestCase):
                                  modified_at="2026-10-09T12:01:00Z")))
         self.assertIn("tx:x", live_keys(self.sp, "歌单"))  # 加回来就恢复
 
-    # D34：删除后加回来就恢复（无墓碑、无冷静期）
+    # 防复活：B 未被告知删除（base_served 仍含 x）就回推 → 残留 → 保持删除
     def test_delete_then_readd_restores(self):
         self.sp.merge("A", sub(pl("p1", "歌单", ("tx", "x"))))
         self.sp.deliver("A")
@@ -100,9 +100,9 @@ class TestFaultInjection(unittest.TestCase):
         # A 删 x（段 modified_at 变化 → 判删）
         self.sp.merge("A", sub(pl("p1", "歌单", modified_at="2026-10-09T12:00:00Z")))
         self.assertNotIn("tx:x", live_keys(self.sp, "歌单"))
-        # B 回推 x → 加回来就恢复
+        # B 从未看过删除结果（base_served 仍含 x）→ 回推是残留 → 不复活
         self.sp.merge("B", sub(pl("p1", "歌单", ("tx", "x"))))
-        self.assertIn("tx:x", live_keys(self.sp, "歌单"))
+        self.assertNotIn("tx:x", live_keys(self.sp, "歌单"))
 
     # D34：删除传播后保持删除，直到有人加回来
     def test_delete_propagates_and_stays(self):
@@ -122,7 +122,7 @@ class TestFaultInjection(unittest.TestCase):
         self.sp.merge("B", sub(pl("p1", "歌单")))
         self.assertNotIn("tx:x", live_keys(self.sp, "歌单"))
 
-    # D34：持续回推 → 加回来就加回来（无压制）
+    # 防复活：残留回推永不复活（B 未被告知删除）
     def test_readd_always_restores(self):
         self.sp.merge("A", sub(pl("p1", "歌单", ("tx", "x"))))
         self.sp.deliver("A")
@@ -134,9 +134,9 @@ class TestFaultInjection(unittest.TestCase):
         # A 删 x（段 modified_at 变化 → 判删）
         self.sp.merge("A", sub(pl("p1", "歌单", modified_at="2026-10-09T12:00:00Z")))
         self.assertNotIn("tx:x", live_keys(self.sp, "歌单"))
-        # B 回推 x → 加回来就恢复（无冷静期压制）
+        # B/C 都未看过删除结果 → 回推是残留 → 不复活（无冷静期压制也不需要了）
         self.sp.merge("B", sub(pl("p1", "歌单", ("tx", "x"))))
-        self.assertIn("tx:x", live_keys(self.sp, "歌单"))
+        self.assertNotIn("tx:x", live_keys(self.sp, "歌单"))
 
     # 并发串行化：多次交错 PUT 后，全客户端视图一致、revision 有界
     def test_serialized_interleave_bounded(self):

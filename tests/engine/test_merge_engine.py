@@ -160,12 +160,14 @@ class TestMergeEngine(unittest.TestCase):
         self.sp.deliver("A")
         self.sp.merge("A", sub(pl("p1", "歌单", ("tx", "x"), modified_at="2026-10-09T03:00:00Z")))
         self.sp.deliver("A")
-        # 重装 = 新身份客户端
+        # 重装 = 新身份客户端（从未交付过 → base_served 缺失 → 带来的已删条目视为残留）
         self.sp.register_client("C", dialect="cyshine-v1", identity_verified=False)
         rc = self.sp.merge("C", sub(pl("p1", "歌单", ("tx", "x"), ("wy", "y"))))
         self.sp.deliver("C")
-        # 首次接入只增不删 → y 回来了
-        self.assertEqual(live_track_keys(self.sp, pl_id_of(self.sp, "歌单")), {"tx:x", "wy:y"})
+        # 首次接入只增不删；但 y 是 A 已删的条目、C 从未被告知 → 残留不复活
+        self.assertEqual(live_track_keys(self.sp, pl_id_of(self.sp, "歌单")), {"tx:x"})
+        self.assertEqual(
+            rc.meta["revival_skipped"]["tracks"].get(pl_id_of(self.sp, "歌单")), ["wy:y"])
 
     # 用例 10：歌单改名 → 不复制歌单
     def test_10_rename_no_duplicate(self):
@@ -324,7 +326,7 @@ class TestMergeEngine(unittest.TestCase):
         self.sp.deliver("R")
         self.assertEqual(len(live_track_keys(self.sp, pl_id_of(self.sp, "歌单"))), 10)
 
-    # 用例 23：离线回归 → 已删的歌加回来就恢复（无冷静期）
+    # 用例 23：离线回归 → 未看过删除结果的残留回推不复活
     def test_23_offline_return_restore(self):
         self.sp.merge("A", sub(pl("p1", "歌单", ("tx", "x"))))
         self.sp.deliver("A")
@@ -333,10 +335,10 @@ class TestMergeEngine(unittest.TestCase):
         self.sp.deliver("A")
         self.sp.merge("A", sub(pl("p1", "歌单", modified_at="2026-10-09T03:00:00Z")))
         self.sp.deliver("A")
-        # B 回归，带着旧视图（含 x）→ x 恢复（加回来就是加回来）
+        # B 回归，带着旧视图（含 x），从未看过删除结果（base_served 仍含 x）→ 残留 → 不复活
         self.sp.merge("B", sub(pl("p1", "歌单", ("tx", "x"))))
         self.sp.deliver("B")
-        self.assertIn("tx:x", live_track_keys(self.sp, pl_id_of(self.sp, "歌单")))
+        self.assertNotIn("tx:x", live_track_keys(self.sp, pl_id_of(self.sp, "歌单")))
 
     # 用例 24：未适配方言 → 隔离
     def test_24_unadapted_dialect_no_pollution(self):

@@ -178,9 +178,11 @@ class MultiDeviceEngineTest(unittest.TestCase):
         self.assertIn(p2, r.meta["removed_playlists"])  # D32：交付过 + 可信 ⇒ 判删
         self.assertNotIn(p2, canon_playlists(sp, L.client_id))
 
-        # D34：洛雪本地还留着这张歌单 → 回推即恢复（无墓碑压制、无冷静期）
+        # 防复活：洛雪本地还留着这张歌单、但从未看过删除结果（base_served 缺失）
+        # → 回推是残留 → 创建者回推也不得复活
         r2 = sp.merge(L.client_id, L2)
-        self.assertIn(p2, canon_playlists(sp, A.client_id))
+        self.assertNotIn(p2, canon_playlists(sp, A.client_id))
+        self.assertIn(p2, r2.meta["revival_skipped"]["playlists"])
 
     # ---- M1-c：A 确实删掉自己加过的歌 ⇒ 照常删除（R1 不削弱 D22） ----
     def test_m1c_real_delete_still_works(self):
@@ -418,9 +420,10 @@ class MultiDeviceEngineTest(unittest.TestCase):
         sp.deliver(A.client_id)                       # A GET2 → served=rev2（对齐，I2′ 放行）
         sp.merge(A.client_id, sub([], nid="p2", name="空"))  # A 删 p1（owned 直删）→ rev3
         pl_id = next(k for k, v in sp.playlists.items() if v.name == "歌单")
-        # D34：B 拿删除前的旧视图回推 → 加回来就加回来（无墓碑压制）
+        # 防复活：B 从未交付过（base_served None = 从未看过删除结果）→ 回推是残留 → 不复活
         rb = sp.merge(B.client_id, sub([("tx", "x")], nid="p1", name="歌单"))
-        self.assertIn(pl_id, canon_playlists(sp, A.client_id))
+        self.assertNotIn(pl_id, canon_playlists(sp, A.client_id))
+        self.assertIn(pl_id, rb.meta["revival_skipped"]["playlists"])
 
     # ---- 第四轮 P0-A：交付 stamp 必须严格大于客户端刚提交的 modifiedAt ----
     def test_stamp_beats_submitted_modified_at(self):
@@ -581,6 +584,85 @@ class MultiDeviceEngineTest(unittest.TestCase):
         view, _ = sp.render_for(sp.clients[L.client_id])
         self.assertEqual(len(view[pl_yes]["tracks"]), 4)       # 来源歌单仍完整
         self.assertEqual(sp.revision, rev + 1)                 # 删歌单照常推进 revision
+
+
+# ---- 防复活（2026-10-10 合并逻辑改造）：已删条目的"残留回推"不复活 ----
+# 语义：只有该端已被告知删除（base_served 交付视图无此条目）后的再次提交才算主动加回、
+# 允许恢复；从未交付过（base_served 缺失）或交付视图仍含该条目的端，提交视为残留，保持删除。
+class AntiReviveTest(unittest.TestCase):
+
+    def _space(self):
+        return SyncSpace(f"space:antirevive-{os.getpid()}-{id(self)}")
+
+    def _dev(self, sp, did, dialect="cyshine-v1"):
+        return sp.register_client(f"acct:{dialect}:{did}", dialect=dialect,
+                                  identity_verified=True, can_delete=True)
+
+    def live_keys(self, sp, client):
+        view, _ = sp.render_for(sp.clients[client])
+        return {k for e in view.values() for k in e["tracks"]}
+
+    def live_playlists(self, sp, client):
+        view, _ = sp.render_for(sp.clients[client])
+        return set(view.keys())
+
+    # 曲目级：从未交付过（base_served None）的端回推已删曲目 → 残留 → 不复活
+    def test_track_residue_from_never_delivered_client_stays_deleted(self):
+        sp = self._space()
+        A = self._dev(sp, "d-a")
+        B = self._dev(sp, "d-b")
+        sp.merge(A.client_id, sub([("tx", "x")]))
+        sp.deliver(A.client_id)
+        sp.merge(B.client_id, sub([("tx", "x")]))       # B 提交过、但从未 GET
+        r = sp.merge(A.client_id, sub([], modified_at="2026-10-09T12:00:00Z"))  # A 删 x
+        self.assertNotIn("tx:x", self.live_keys(sp, A.client_id))
+        rb = sp.merge(B.client_id, sub([("tx", "x")]))  # B 残留回推
+        self.assertNotIn("tx:x", self.live_keys(sp, A.client_id))
+        self.assertTrue(rb.meta["revival_skipped"]["tracks"])
+
+    # 同端：删除后未 GET 就重加 = 残留 → 不复活；GET 过（看过删除）后重加 = 主动加回 → 恢复
+    def test_same_client_readd_without_get_is_residue_but_after_get_restores(self):
+        sp = self._space()
+        A = self._dev(sp, "d-a")
+        sp.merge(A.client_id, sub([("tx", "x")]))
+        sp.deliver(A.client_id)
+        # A 删 x（段 modified_at 变化 → 判删），但删除后没有再 GET（base_served 仍含 x）
+        sp.merge(A.client_id, sub([], modified_at="2026-10-09T12:00:00Z"))
+        r = sp.merge(A.client_id, sub([("tx", "x")]))   # 未看过删除 → 残留 → 不复活
+        self.assertNotIn("tx:x", self.live_keys(sp, A.client_id))
+        self.assertTrue(r.meta["revival_skipped"]["tracks"])
+        # A GET 跨过删除点（已被告知删除）后重加 → 主动加回 → 恢复
+        sp.deliver(A.client_id)
+        r2 = sp.merge(A.client_id, sub([("tx", "x")]))
+        self.assertIn("tx:x", self.live_keys(sp, A.client_id))
+        self.assertFalse(r2.meta["revival_skipped"]["tracks"])
+
+    # 混合收敛：A 删 y、B 从未看过删除并带回 y 又新增 z → 最终 y 保持删除、x/z 在场
+    def test_mixed_add_delete_converges_without_revive(self):
+        sp = self._space()
+        A = self._dev(sp, "d-a")
+        B = self._dev(sp, "d-b")
+        sp.merge(A.client_id, sub([("tx", "x"), ("tx", "y")], nid="p1", name="P1"))
+        sp.deliver(A.client_id)
+        sp.merge(B.client_id, sub([("tx", "x"), ("tx", "y")], nid="p1", name="P1"))
+        sp.deliver(B.client_id)
+        # A 删 y（modified_at 变化 → 判删）并 GET 跨过删除点
+        sp.merge(A.client_id, sub([("tx", "x")], nid="p1", name="P1",
+                                  modified_at="2026-10-09T12:00:00Z"))
+        sp.deliver(A.client_id)
+        self.assertNotIn("tx:y", self.live_keys(sp, A.client_id))
+        # B 从未看过删除：回推 P1（x, y）+ 新增 z → y 是残留不复活，x/z 正常合并
+        r = sp.merge(B.client_id, {"playlists": [
+            {"native_id": "p1", "name": "P1",
+             "tracks": [{"source": "tx", "songId": "x"}, {"source": "tx", "songId": "y"},
+                        {"source": "kw", "songId": "z"}]},
+        ]})
+        keys = self.live_keys(sp, A.client_id)
+        self.assertIn("tx:x", keys)
+        self.assertIn("kw:z", keys)
+        self.assertNotIn("tx:y", keys)
+        self.assertIn("tx:y", [k for ks in r.meta["revival_skipped"]["tracks"].values()
+                               for k in ks])
 
 
 if __name__ == "__main__":
