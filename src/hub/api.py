@@ -158,7 +158,7 @@ def _ensure_v3() -> bool:
         return False
     changed = False
     for acc, meta in _users.items():
-        sp = meta.get("space") or acc
+        sp: str = meta.get("space") or acc
         if sp not in _spaces:
             _spaces[sp] = {
                 "name": sp,
